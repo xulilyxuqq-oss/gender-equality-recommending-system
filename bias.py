@@ -1,22 +1,19 @@
-import json
 from pathlib import Path
 import pandas as pd
 
 # 首先，获取当前脚本所在的目录路径
 BASE_DIR = Path(__file__).resolve().parent
 
-# 开始读文件
-with (BASE_DIR /"dataset" /"user_info.jsonl").open("r", encoding = "utf-8") as f:
-    userdata = json.load(f)
-with (BASE_DIR /"dataset" /"course_info.jsonl").open("r", encoding = "utf-8") as f:
-    coursedata = json.load(f)
-with (BASE_DIR /"dataset" /"user_course_interactions").open("r", encoding = "utf-8") as f:
-    interactiondata = json.load(f)
-
-# 用pandas dataframe格式读取数据
-df_user = pd.DataFrame(userdata)
-df_course = pd.DataFrame(coursedata)
-df_interaction = pd.DataFrame(interactiondata)
+# JSONL 文件的每一行都是一个独立的 JSON 对象，因此需要使用 lines=True
+df_user = pd.read_json(
+    BASE_DIR / "dataset" / "user_info.jsonl", lines=True
+)[["user_id", "gender_code"]]
+df_course = pd.read_json(
+    BASE_DIR / "dataset" / "course_info.jsonl", lines=True
+)[["course_id"]]
+df_interaction = pd.read_json(
+    BASE_DIR / "dataset" / "user_course_interactions.jsonl", lines=True
+)[["user_id", "course_id", "comment"]]
 
 
 ### 合并三个表，以及处理男女用户信息
@@ -32,32 +29,35 @@ number_male = df_user[df_user["gender_code"] == 1]["user_id"].nunique()
 number_female = df_user[df_user["gender_code"] == 2]["user_id"].nunique()
 
 if number_male == 0 or number_female == 0:
-    print("Error: One of the gender groups has zero users. Cannot compute bias.")
+    raise ValueError("One of the gender groups has zero users. Cannot compute bias.")
 
 print(number_male, number_female)
 
 # 计算UVR和IVB两个指标
 
 # UVR指标计算 
-number_male_comment = df_user_course_interaction[(df_user_course_interaction["gender_code"] == 1) & (df_user_course_interaction["comment_score"] != 0)]["user_id"].nunique()
-number_female_comment = df_user_course_interaction[(df_user_course_interaction["gender_code"] == 2) & (df_user_course_interaction["comment_score"] != 0)]["user_id"].nunique()
+commented = df_user_course_interaction[df_user_course_interaction["comment"] != 0]
+number_male_comment = commented[commented["gender_code"] == 1]["user_id"].nunique()
+number_female_comment = commented[commented["gender_code"] == 2]["user_id"].nunique()
 
 print("男性的评论用户数：", number_male_comment,"女性的评论用户数：", number_female_comment)
+
+if number_male_comment == 0 or number_female_comment == 0:
+    raise ValueError("One of the gender groups has zero commenting users. Cannot compute bias.")
 
 P_female = number_female_comment / number_female
 P_male = number_male_comment / number_male
 
-UPR = P_female / P_male
-print("UVR指标：", UPR)
+UVR = P_female / P_male
+print("UVR指标：", UVR)
 
 # IVB指标计算
-female_comment_score_sum = 0
-male_comment_score_sum = 0
-for interaction in df_user_course_interaction:
-    if interaction["gender_code"] == 1:
-        male_comment_score_sum += interaction["comment_score"]
-    elif interaction["gender_code"] ==2:
-        female_comment_score_sum += interaction["comment_score"]
+male_comment_score_sum = commented.loc[
+    commented["gender_code"] == 1, "comment"
+].sum()
+female_comment_score_sum = commented.loc[
+    commented["gender_code"] == 2, "comment"
+].sum()
 
 female_comment_score_avg = female_comment_score_sum / number_female_comment
 male_comment_score_avg = male_comment_score_sum / number_male_comment
