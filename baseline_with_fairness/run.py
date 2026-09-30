@@ -22,6 +22,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--implicit-score", type=float, default=1.0)
     parser.add_argument("--ignore-prerequisites", action="store_true")
     parser.add_argument("--target-gap", type=float, default=0.05)
+    parser.add_argument("--fairness-lambda", type=float, default=0.0)
     parser.add_argument("--max-total-cost", type=float)
     parser.add_argument("--output-dir", type=Path, default=Path("output/fair_workflow"))
     return parser
@@ -32,6 +33,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args.output_dir.mkdir(parents=True, exist_ok=True)
     candidates = args.output_dir / "baseline_candidates.jsonl"
     baseline = args.output_dir / "baseline_recommendations.jsonl"
+    regularized = args.output_dir / "regularized_candidates.jsonl"
     fair = args.output_dir / "fair_recommendations.jsonl"
     summary = args.output_dir / "fair_rerank_summary.json"
     baseline_args = [
@@ -58,6 +60,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--courses", str(args.courses),
         "--top-n", str(args.top_n),
         "--target-gap", str(args.target_gap),
+        "--fairness-lambda", str(args.fairness_lambda),
+        "--regularized-output", str(regularized),
         "--output", str(fair),
         "--summary", str(summary),
     ]

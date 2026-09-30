@@ -7,23 +7,18 @@ import sys
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-
-def _group_counts(lists: Mapping[str, Sequence[Mapping[str, Any]]], genders: Mapping[str, int], advanced: set[str]) -> tuple[dict[int, int], dict[int, int]]:
-    total = {1: 0, 2: 0}
-    advanced_count = {1: 0, 2: 0}
-    for user_id, rows in lists.items():
-        gender = genders.get(user_id)
-        if gender not in total:
-            continue
-        total[gender] += len(rows)
-        advanced_count[gender] += sum(str(row["course_id"]) in advanced for row in rows)
-    if total[1] == 0 or total[2] == 0:
-        raise ValueError("两个性别组都必须包含至少一个推荐位置。")
-    return total, advanced_count
+from .fair_scoring import (
+    exposure_from_counts,
+    group_counts,
+    regularize_candidates,
+)
 
 
-def _exposure(total: Mapping[int, int], advanced_count: Mapping[int, int]) -> dict[str, float]:
-    return {str(group): advanced_count[group] / total[group] for group in (1, 2)}
+def _ranking_score(row: Mapping[str, Any]) -> float:
+    """返回公平排序分；旧候选回退到原始预测分。"""
+
+    return float(row.get("ranking_score", row["predicted_score"]))
+
 
 #最终推荐10个，待选可能是50个，top-n,top-m,gender对应性别，1代表男，2代表女，target_gap是允许的最大群体曝光差，max total cost是可选的累计分数损失上限，d二换出的课程得分 - 换入的课程得分
 #输入如上
@@ -44,11 +39,11 @@ def rerank_min_cost(candidates: Mapping[str, Sequence[Mapping[str, Any]]], gende
     #整理一下top_m 候选课程列表
     ordered = {user_id: sorted((dict(row) for row in rows), key=lambda row: (int(row["rank"]), str(row["course_id"]))) for user_id, rows in candidates.items()}
     #整理一下目前的top_n推荐课程列表
-    result = {user_id: [{**row, "original_rank": int(row["rank"]), "reranked": False, "swap_cost": 0.0} for row in rows[:top_n]] for user_id, rows in ordered.items()}
+    result = {user_id: [{**row, "original_rank": int(row.get("original_rank", row["rank"])), "reranked": False, "swap_cost": 0.0} for row in rows[:top_n]] for user_id, rows in ordered.items()}
     #统计一下重排之前的推荐位置和高阶数量
-    total, advanced_count = _group_counts(result, genders, advanced_course_ids)
+    total, advanced_count = group_counts(result, genders, advanced_course_ids)
     #计算重排之前的曝光率
-    exposure_before = _exposure(total, advanced_count)
+    exposure_before = exposure_from_counts(total, advanced_count)
     #计算重排之前的曝光差
     initial_gap = abs(exposure_before["1"] - exposure_before["2"])
     #处理一下如果初始的曝光差已经小于等于目标曝光差，那么不需要进行重排，直接返回结果
@@ -134,8 +129,8 @@ def rerank_min_cost(candidates: Mapping[str, Sequence[Mapping[str, Any]]], gende
         incoming = dict(proposal["incoming"])
         #在topn推荐列表中找到需要换出的课程，并将其替换为换入课程
         updated = [row for row in result[user_id] if str(row["course_id"]) != outgoing_id]
-        updated.append({**incoming, "original_rank": int(incoming["rank"]), "reranked": True, "swap_cost": cost})
-        updated.sort(key=lambda row: (-float(row["predicted_score"]), str(row["course_id"])))
+        updated.append({**incoming, "original_rank": int(incoming.get("original_rank", incoming["rank"])), "reranked": True, "swap_cost": cost})
+        updated.sort(key=lambda row: (-_ranking_score(row), str(row["course_id"])))
         #为换位之后的列表重新生成排名
         for rank, row in enumerate(updated, start=1):
             row["rank"] = rank
@@ -153,7 +148,7 @@ def rerank_min_cost(candidates: Mapping[str, Sequence[Mapping[str, Any]]], gende
             "swap_cost": cost,
         })
     #计算最终的群体曝光率
-    exposure_after = _exposure(total, advanced_count)
+    exposure_after = exposure_from_counts(total, advanced_count)
     #换位执行完毕之后的最终曝光率差
     if swap_records and abs(exposure_after["1"] - exposure_after["2"]) <= target_gap + 1e-12:
         stop_reason = "target_gap_reached"
@@ -204,6 +199,11 @@ def _load_candidates(path: Path) -> dict[str, list[dict[str, Any]]]:
         score_value = row["predicted_score"]
         if isinstance(score_value, bool) or not isinstance(score_value, (int, float)) or not math.isfinite(float(score_value)):
             raise ValueError("predicted_score 必须是有限数值。")
+        ranking_value = row.get("ranking_score")
+        if ranking_value is not None:
+            if isinstance(ranking_value, bool) or not isinstance(ranking_value, (int, float)) or not math.isfinite(float(ranking_value)):
+                raise ValueError("ranking_score 必须是有限数值。")
+            row["ranking_score"] = float(ranking_value)
         rank_value = row["rank"]
         if isinstance(rank_value, bool) or not isinstance(rank_value, int) or rank_value <= 0:
             raise ValueError("rank 必须是正整数。")
@@ -215,9 +215,10 @@ def _load_candidates(path: Path) -> dict[str, list[dict[str, Any]]]:
         ranks = [int(row["rank"]) for row in ranked]
         if ranks != list(range(1, len(ranked) + 1)):
             raise ValueError(f"用户 {user_id} 的 rank 必须从 1 开始连续且唯一。")
-        scores = [float(row["predicted_score"]) for row in ranked]
+        scores = [_ranking_score(row) for row in ranked]
         if any(left < right for left, right in zip(scores, scores[1:])):
-            raise ValueError(f"用户 {user_id} 的候选必须按预测分降序排列。")
+            score_name = "排序分" if any("ranking_score" in row for row in ranked) else "预测分"
+            raise ValueError(f"用户 {user_id} 的候选必须按{score_name}降序排列。")
     return grouped
 
 
@@ -260,8 +261,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--courses", type=Path, required=True, help="包含 is_advanced 的课程 JSONL。")
     parser.add_argument("--top-n", type=int, default=10, help="最终每位用户保留的课程数。")
     parser.add_argument("--target-gap", type=float, default=0.05, help="允许的最大群体曝光差。")
+    parser.add_argument("--fairness-lambda", type=float, default=0.0, help="候选排序中的公平正则权重。")
     parser.add_argument("--max-total-cost", type=float, help="可选的累计分数损失上限。")
     parser.add_argument("--output", type=Path, required=True, help="公平 Top-N JSONL 输出路径。")
+    parser.add_argument("--regularized-output", type=Path, help="可选的正则化 Top-M 候选 JSONL 输出路径。")
     parser.add_argument("--summary", type=Path, help="可选的重排摘要 JSON 输出路径。")
     args = parser.parse_args(argv)
     try:
@@ -276,7 +279,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         if missing_courses:
             raise ValueError(f"课程表缺少候选课程：{', '.join(missing_courses[:5])}")
         advanced = {course_id for course_id, flag in course_flags.items() if flag}
-        results, summary = rerank_min_cost(candidates, genders, advanced, args.top_n, args.target_gap, args.max_total_cost)
+        regularized, regularization_summary = regularize_candidates(
+            candidates,
+            genders,
+            advanced,
+            top_n=args.top_n,
+            fairness_lambda=args.fairness_lambda,
+            target_gap=args.target_gap,
+        )
+        if args.regularized_output is not None:
+            _write_results(args.regularized_output, regularized)
+        results, summary = rerank_min_cost(regularized, genders, advanced, args.top_n, args.target_gap, args.max_total_cost)
+        summary["regularization"] = regularization_summary
         _write_results(args.output, results)
         summary_text = json.dumps(summary, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
         if args.summary is None:
