@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="description" content="通过课程确认建立画像，并获得可解释的后续课程推荐。" />
+    <meta name="color-scheme" content="light dark" />
+    <title>课序 | 课程推荐</title>
+    <link rel="icon" href="data:," />
+    <link rel="preload" as="image" href="./public/assets/hero-course-planning.jpg" />
+    <link rel="stylesheet" href="./src/styles.css" />
+  </head>
+  <body>
+    <a class="skip-link" href="#main-content">跳到主要内容</a>
+    <div id="root">
+      <main class="boot-screen" aria-live="polite">
+        <strong>课序</strong>
+        <span>正在准备课程目录</span>
+      </main>
+    </div>
+    <div id="drawer-root"></div>
+    <div id="toast-root" class="toast-region" aria-live="polite"></div>
+    <script type="module" src="./src/main.js"></script>
+  </body>
+</html>

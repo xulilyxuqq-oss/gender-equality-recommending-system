@@ -216,4 +216,11 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
-dataset/
+# Keep generated/raw dataset artifacts out of Git, while allowing the database
+# schema, builders, and documentation to be versioned.
+dataset/*
+!dataset/__init__.py
+!dataset/*.py
+!dataset/schema.sql
+!dataset/*.sql.gz
+!dataset/*.md

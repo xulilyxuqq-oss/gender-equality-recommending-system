@@ -1,0 +1,357 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <!--
+      THESIS: 把课程推荐变成一次清楚、可确认的学习路径整理过程。
+      OWN-WORLD: 冷调纸面、深墨导航、纸质课程卡与克制的黄色重点。
+      STORY: 用户注册后与智能体对话，逐项确认自然语言课程，再看到下一阶段课程被安排进推荐板。
+      FIRST VIEWPORT: 左侧是明确主张与开始按钮，右侧是真实的课程规划场景。
+      FORM: 不对称编辑式布局，突出学习路径与用户确认。
+    -->
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta
+      name="description"
+      content="性别公平课程推荐系统的无数据库交互演示"
+    />
+    <title>课序 · 课程推荐 Demo</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <a class="skip-link" href="#main-content">跳到主要内容</a>
+
+    <div class="app-shell">
+      <aside class="sidebar" id="sidebar" aria-label="主导航">
+        <button class="brand" type="button" data-route="home" aria-label="返回首页">
+          <span class="brand-mark" aria-hidden="true">
+            <span></span><span></span><span></span>
+          </span>
+          <span>
+            <strong>课序</strong>
+            <small>COURSE COMPASS</small>
+          </span>
+        </button>
+
+        <nav class="nav-list">
+          <button class="nav-item is-active" type="button" data-route="home">
+            <span>首页</span>
+          </button>
+          <button class="nav-item" type="button" data-route="assistant">
+            <span>智能推荐</span>
+          </button>
+          <button class="nav-item" type="button" data-route="recommendations">
+            <span>推荐结果</span>
+          </button>
+          <button class="nav-item" type="button" data-route="history">
+            <span>历史记录</span>
+          </button>
+          <button class="nav-item" type="button" data-route="favorites">
+            <span>我的收藏</span>
+          </button>
+        </nav>
+
+        <div class="sidebar-foot">
+          <span class="demo-badge">内存演示</span>
+          <button class="account-chip" type="button" data-route="auth">
+            <span class="account-avatar" id="sidebar-avatar">访</span>
+            <span>
+              <strong id="sidebar-name">访客模式</strong>
+              <small id="sidebar-status">尚未创建账号</small>
+            </span>
+          </button>
+        </div>
+      </aside>
+
+      <div class="mobile-bar">
+        <button class="icon-button menu-trigger" id="menu-button" type="button" aria-label="打开导航" aria-expanded="false">菜单</button>
+        <button class="mobile-brand" type="button" data-route="home">课序</button>
+        <span class="demo-badge">Demo</span>
+      </div>
+
+      <main id="main-content" class="main-content" tabindex="-1">
+        <section class="view is-visible" id="view-home" data-view="home" aria-labelledby="home-title">
+          <div class="home-hero">
+            <div class="hero-copy">
+              <div class="hero-kicker">
+                <span class="kicker-block"></span>
+                <span>课程推荐，从学习经历开始</span>
+              </div>
+              <h1 id="home-title"><span>学过的课，</span><span>排成下一步。</span></h1>
+              <p>描述学过的课程，逐项确认后获得满足先修要求的推荐。</p>
+              <div class="hero-actions">
+                <button class="button button-accent button-large" type="button" data-route="auth">
+                  开始体验
+                </button>
+                <button class="text-button" type="button" id="watch-demo">了解确认流程</button>
+              </div>
+            </div>
+
+            <figure class="hero-visual">
+              <img
+                src="./assets/hero-course-planning.jpg"
+                width="1122"
+                height="1402"
+                alt="学生在图书馆桌前整理课程卡片和学习笔记"
+                fetchpriority="high"
+              />
+              <figcaption>先确认学习经历，再生成下一阶段课程。</figcaption>
+            </figure>
+          </div>
+
+          <p class="demo-disclosure">本页面使用模拟数据，不连接数据库或外部模型。</p>
+
+          <section class="mechanism-strip" id="mechanism-strip" aria-labelledby="mechanism-title">
+            <div class="mechanism-intro">
+              <h2 id="mechanism-title">不是填表，是一起把课程理清楚。</h2>
+              <p>每门课程都由你确认，系统不会根据一句模糊回答直接写入画像。</p>
+            </div>
+            <ol class="mechanism-path">
+              <li><strong>描述学习经历</strong><span>用自然语言说出学过的课程。</span></li>
+              <li><strong>核对课程身份</strong><span>从课程库候选中逐项确认。</span></li>
+              <li><strong>生成课程建议</strong><span>只推荐已满足先修要求的课程。</span></li>
+            </ol>
+          </section>
+
+          <section class="product-showcase" aria-labelledby="showcase-title">
+            <div class="showcase-copy">
+              <h2 id="showcase-title">确认过程清楚，推荐结果也有依据。</h2>
+              <p>对话中保留每次课程选择，结果页解释推荐来源和先修状态。</p>
+            </div>
+            <div class="product-shots">
+              <figure class="product-shot product-shot--wide">
+                <img src="./assets/product-recommendations.jpg" width="1440" height="900" alt="推荐结果页面，展示课程排名、先修状态和推荐理由" loading="lazy" />
+                <figcaption>推荐结果</figcaption>
+              </figure>
+              <figure class="product-shot product-shot--tall">
+                <img src="./assets/product-assistant.jpg" width="1440" height="1656" alt="智能推荐页面，展示课程匹配确认卡和画像草稿" loading="lazy" />
+                <figcaption>课程确认</figcaption>
+              </figure>
+            </div>
+          </section>
+        </section>
+
+        <section class="view" id="view-auth" data-view="auth" aria-labelledby="auth-title">
+          <div class="auth-layout">
+            <div class="auth-context">
+              <button class="back-link" type="button" data-route="home">
+                <span aria-hidden="true">←</span> 返回首页
+              </button>
+              <div class="auth-context-body">
+                <span class="section-kicker">建立演示账号</span>
+                <h1 id="auth-title">先保留一个位置，<br />画像稍后再聊。</h1>
+                <p>注册阶段只创建账号。姓名、性别和已学课程会在下一步由智能体逐步询问。</p>
+                <ul class="assurance-list">
+                  <li>不会在注册时要求填写画像</li>
+                  <li>所有课程匹配都需要你确认</li>
+                  <li>刷新页面后演示数据会重置</li>
+                </ul>
+              </div>
+            </div>
+
+            <div class="auth-workspace">
+              <div class="session-panel" id="session-panel" hidden>
+                <span class="form-step">当前演示账号</span>
+                <h2 id="session-account-name">course_demo</h2>
+                <p>当前账号与画像仅保存在浏览器内存中。</p>
+                <button class="button button-primary button-block" type="button" data-route="assistant">继续智能推荐</button>
+                <button class="button button-quiet button-block" type="button" id="logout-button">退出账号</button>
+              </div>
+
+              <div class="auth-tabs" id="auth-tabs" role="tablist" aria-label="注册或登录">
+                <button class="auth-tab is-active" id="register-tab" type="button" role="tab" aria-selected="true" aria-controls="register-form">创建账号</button>
+                <button class="auth-tab" id="login-tab" type="button" role="tab" aria-selected="false" aria-controls="login-form">登录账号</button>
+              </div>
+
+              <form class="auth-form" id="register-form">
+                <div class="form-heading">
+                  <span class="form-step">演示入口</span>
+                  <h2>创建账号</h2>
+                  <p>无需真实邮箱，也不会发送任何数据。</p>
+                </div>
+                <label>
+                  <span>用户名</span>
+                  <input id="register-username" name="username" autocomplete="username" placeholder="例如：lily_demo" required />
+                </label>
+                <label>
+                  <span>密码</span>
+                  <input id="register-password" name="password" type="password" autocomplete="new-password" placeholder="8-72 位" minlength="8" maxlength="72" required />
+                </label>
+                <label>
+                  <span>确认密码</span>
+                  <input id="register-confirm" name="confirmPassword" type="password" autocomplete="new-password" placeholder="再次输入密码" minlength="8" maxlength="72" required />
+                </label>
+                <p class="form-error" id="register-error" role="alert"></p>
+                <button class="button button-primary button-block" type="submit">
+                  创建并进入对话
+                </button>
+                <button class="button button-quiet button-block" type="button" id="demo-account">
+                  使用演示账号直接进入
+                </button>
+              </form>
+
+              <form class="auth-form" id="login-form" hidden>
+                <div class="form-heading">
+                  <span class="form-step">返回演示</span>
+                  <h2>登录账号</h2>
+                  <p>登录本次页面会话中创建的内存账号。</p>
+                </div>
+                <label>
+                  <span>用户名</span>
+                  <input id="login-username" name="username" autocomplete="username" placeholder="输入用户名" required />
+                </label>
+                <label>
+                  <span>密码</span>
+                  <input id="login-password" name="password" type="password" autocomplete="current-password" placeholder="输入密码" required />
+                </label>
+                <p class="form-error" id="login-error" role="alert"></p>
+                <button class="button button-primary button-block" type="submit">
+                  登录并继续
+                </button>
+                <p class="form-note">预置账号：course_demo / demo1234</p>
+              </form>
+            </div>
+          </div>
+        </section>
+
+        <section class="view" id="view-assistant" data-view="assistant" aria-labelledby="assistant-title">
+          <header class="page-header">
+            <div>
+              <span class="section-kicker">智能推荐</span>
+              <h1 id="assistant-title">一起整理你的学习路径</h1>
+            </div>
+            <div class="status-cluster">
+              <span class="live-dot"></span>
+              <span id="assistant-status">等待开始</span>
+            </div>
+          </header>
+
+          <div class="assistant-layout">
+            <section class="chat-workspace" aria-label="与课程智能体对话">
+              <div class="chat-thread" id="chat-thread" aria-live="polite" aria-relevant="additions"></div>
+              <form class="composer" id="chat-form">
+                <label class="sr-only" for="chat-input">输入消息</label>
+                <textarea id="chat-input" rows="1" placeholder="输入你的回答…" required></textarea>
+                <button class="send-button" type="submit">发送</button>
+              </form>
+              <p class="composer-hint" id="composer-hint">按 Enter 发送，Shift + Enter 换行</p>
+            </section>
+
+            <aside class="profile-board" aria-label="画像草稿">
+              <div class="profile-board-head">
+                <div>
+                  <span class="section-kicker">画像草稿</span>
+                  <h2>已确认信息</h2>
+                </div>
+                <span class="progress-count" id="profile-progress">0 / 3</span>
+              </div>
+
+              <dl class="profile-fields">
+                <div>
+                  <dt>姓名</dt>
+                  <dd id="profile-name">等待填写</dd>
+                </div>
+                <div>
+                  <dt>性别</dt>
+                  <dd id="profile-gender">等待填写</dd>
+                </div>
+              </dl>
+
+              <div class="profile-edit-actions">
+                <button type="button" data-edit-profile="name">修改姓名</button>
+                <button type="button" data-edit-profile="gender">重选性别</button>
+                <button type="button" data-edit-profile="courses">继续添加课程</button>
+              </div>
+
+              <div class="profile-courses">
+                <div class="profile-courses-head">
+                  <span>已学课程</span>
+                  <span id="course-count">0 门</span>
+                </div>
+                <div id="confirmed-courses" class="confirmed-courses">
+                  <div class="empty-course-slot">
+                    <span>课程确认后会落在这里</span>
+                  </div>
+                </div>
+              </div>
+
+              <button class="button button-accent button-block" id="confirm-profile" type="button" disabled>
+                确认画像并生成推荐
+              </button>
+              <p class="profile-note">只有经过你确认的课程会进入画像。</p>
+            </aside>
+          </div>
+        </section>
+
+        <section class="view" id="view-recommendations" data-view="recommendations" aria-labelledby="recommendations-title">
+          <header class="page-header recommendation-header">
+            <div>
+              <span class="section-kicker">下一阶段课程板</span>
+              <h1 id="recommendations-title">为你安排的下一步</h1>
+              <p id="recommendation-subtitle">完成画像后，这里会显示推荐结果。</p>
+            </div>
+            <button class="button button-quiet" type="button" data-route="assistant">
+              调整画像
+            </button>
+          </header>
+
+          <div class="recommendation-meta" id="recommendation-meta" hidden>
+            <span><strong>推荐来源</strong> 相似学习路径</span>
+            <span><strong>生成时间</strong> 刚刚</span>
+            <span><strong>先修检查</strong> 已通过</span>
+          </div>
+
+          <div class="recommendation-board" id="recommendation-board">
+            <div class="empty-state">
+              <h2>课程板还是空的</h2>
+              <p>先与智能体完成画像确认，我们会在这里安排下一阶段课程。</p>
+              <button class="button button-primary" type="button" data-route="assistant">开始智能推荐</button>
+            </div>
+          </div>
+        </section>
+
+        <section class="view" id="view-history" data-view="history" aria-labelledby="history-title">
+          <header class="page-header">
+            <div>
+              <span class="section-kicker">推荐档案</span>
+              <h1 id="history-title">历史记录</h1>
+            </div>
+          </header>
+          <div id="history-list" class="history-list">
+            <div class="empty-state compact">
+              <h2>还没有推荐记录</h2>
+              <p>完成一次推荐后，结果快照会出现在这里。</p>
+            </div>
+          </div>
+        </section>
+
+        <section class="view" id="view-favorites" data-view="favorites" aria-labelledby="favorites-title">
+          <header class="page-header">
+            <div>
+              <span class="section-kicker">课程收藏夹</span>
+              <h1 id="favorites-title">我的收藏</h1>
+            </div>
+          </header>
+          <div id="favorites-list" class="favorite-list">
+            <div class="empty-state compact">
+              <h2>暂时没有收藏</h2>
+              <p>在推荐结果或课程详情中收藏感兴趣的课程。</p>
+            </div>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <aside class="detail-drawer" id="detail-drawer" role="dialog" aria-modal="true" aria-labelledby="detail-title" aria-hidden="true">
+      <div class="drawer-head">
+        <span class="section-kicker">课程详情</span>
+        <button class="drawer-close" id="close-drawer" type="button">关闭</button>
+      </div>
+      <div id="drawer-content"></div>
+    </aside>
+    <div class="drawer-scrim" id="drawer-scrim" hidden></div>
+
+    <div class="toast-region" id="toast-region" aria-live="polite"></div>
+
+    <script src="./app.js"></script>
+  </body>
+</html>
