@@ -1,2 +1,2 @@
-"""Course Compass in-memory API package."""
+"""Course Compass SQLite-backed API package."""
 

@@ -18,6 +18,7 @@ const state = {
   loading: false,
   streaming: false,
   assistantDelta: "",
+  agentTrace: [],
   error: "",
 };
 
@@ -246,6 +247,55 @@ function messageHtml(message) {
   return `<div class="message message-${message.role}"><span class="message-role">${message.role === "assistant" ? "序" : "你"}</span><p>${escapeHtml(message.content)}</p></div>`;
 }
 
+function agentToolLabel(toolName) {
+  return {
+    search_courses: "搜索课程目录",
+    resolve_course: "解析课程描述",
+    get_course: "读取课程详情",
+    get_profile_context: "读取当前画像",
+    get_pending_resolutions: "检查待确认候选",
+    update_draft_name: "更新姓名草稿",
+    update_draft_gender: "更新性别草稿",
+    create_course_resolution: "创建课程候选",
+    accept_course_candidate: "确认课程候选",
+    reject_course_candidate: "排除课程候选",
+    request_profile_confirmation: "检查画像确认条件",
+    create_recommendation: "生成课程推荐",
+  }[toolName] || toolName;
+}
+
+function agentTraceStatusLabel(status) {
+  return {
+    running: "进行中",
+    completed: "已完成",
+    waiting: "等待确认",
+    failed: "失败",
+  }[status] || "记录";
+}
+
+function agentTraceHtml() {
+  if (!state.agentTrace.length) return "";
+  return `
+    <section class="agent-trace" aria-label="智能体执行轨迹" aria-live="polite">
+      <header class="agent-trace-header">
+        <div class="agent-trace-title"><span class="section-label">Agent Trace</span><strong>执行轨迹</strong></div>
+        <span class="agent-trace-state">${state.streaming ? "实时执行中" : "本轮已完成"}</span>
+      </header>
+      <ol class="agent-trace-list">
+        ${state.agentTrace.map((item, index) => `
+          <li class="agent-trace-item agent-trace-${escapeHtml(item.status || "completed")} agent-trace-phase-${escapeHtml(item.phase || "step")}">
+            <span class="agent-trace-rail" aria-hidden="true"><span class="agent-trace-mark">${String(index + 1).padStart(2, "0")}</span></span>
+            <div class="agent-trace-content">
+              <div class="agent-trace-row"><strong>${escapeHtml(item.label || "正在处理")}</strong><span class="agent-trace-badge">${agentTraceStatusLabel(item.status)}</span></div>
+              ${item.tool_name ? `<small>工具 · ${escapeHtml(agentToolLabel(item.tool_name))}</small>` : ""}
+            </div>
+          </li>
+        `).join("")}
+      </ol>
+    </section>
+  `;
+}
+
 function resolutionHtml(resolution) {
   const finalized = resolution.status !== "PENDING";
   const selected = resolution.selected_course_id;
@@ -302,6 +352,7 @@ function assistantView() {
             ${state.assistantDelta ? messageHtml({ role: "assistant", content: state.assistantDelta }) : ""}
             ${session.course_resolutions.map(resolutionHtml).join("")}
           </div>
+          ${agentTraceHtml()}
           ${session.state === "COLLECTING_GENDER" ? `<div class="quick-actions"><button type="button" data-quick-message="男">男</button><button type="button" data-quick-message="女">女</button></div>` : ""}
           ${session.state === "COLLECTING_COURSES" ? `<div class="quick-actions"><button type="button" data-quick-message="我没有学过课程">没有学过课程</button><button type="button" data-quick-message="我没有其他课程">完成课程描述</button></div>` : ""}
           <form class="composer" id="chat-form">
@@ -473,6 +524,7 @@ async function submitChat(message) {
   if (!state.session || state.streaming) return;
   state.streaming = true;
   state.assistantDelta = "";
+  state.agentTrace = [];
   state.session.messages.push({ role: "user", content: message });
   render();
   try {
@@ -482,6 +534,12 @@ async function submitChat(message) {
       ({ event, data }) => {
         if (event === "message.delta") {
           state.assistantDelta += data.text || "";
+          render();
+        }
+        if (event === "agent.step") {
+          const index = state.agentTrace.findIndex((item) => item.trace_id === data.trace_id);
+          if (index >= 0) state.agentTrace[index] = data;
+          else state.agentTrace.push(data);
           render();
         }
       },
@@ -597,7 +655,7 @@ document.addEventListener("click", async (event) => {
       // Local sign-out still succeeds if the in-memory server has restarted.
     }
     setAuth(null);
-    Object.assign(state, { auth: null, profile: null, session: null, recommendation: null, history: [], favorites: [], favoriteIds: new Set() });
+    Object.assign(state, { auth: null, profile: null, session: null, recommendation: null, history: [], favorites: [], favoriteIds: new Set(), agentTrace: [] });
     showToast("已退出账号");
     return go("home");
   }

@@ -12,6 +12,26 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 load_dotenv(PROJECT_ROOT / ".env", override=False)
 
 
+@dataclass(frozen=True)
+class AppSettings:
+    database_path: Path
+    jwt_secret: str = field(repr=False)
+    admin_username: str
+    admin_password: str = field(repr=False)
+    admin_display_name: str
+
+
+def get_app_settings() -> AppSettings:
+    path = Path(os.getenv("DATABASE_PATH", "dataset/recommender.sqlite3"))
+    return AppSettings(
+        database_path=path if path.is_absolute() else PROJECT_ROOT / path,
+        jwt_secret=os.getenv("JWT_SECRET", "course-compass-development-secret-change-in-production"),
+        admin_username=os.getenv("ADMIN_USERNAME", "admin").strip(),
+        admin_password=os.getenv("ADMIN_PASSWORD", "admin1234"),
+        admin_display_name=os.getenv("ADMIN_DISPLAY_NAME", "系统管理员").strip(),
+    )
+
+
 def _boolean(name: str, default: bool = False) -> bool:
     value = os.getenv(name)
     if value is None:
@@ -47,6 +67,10 @@ class AgentSettings:
     max_tokens: int
     timeout_seconds: int
     max_retries: int
+    mode: str = "autonomous"
+    max_steps: int = 6
+    max_tool_calls: int = 8
+    turn_timeout_seconds: int = 30
 
     @property
     def configured(self) -> bool:
@@ -70,4 +94,8 @@ def get_agent_settings() -> AgentSettings:
         max_tokens=_integer("ZHIPUAI_MAX_TOKENS", 1024, 64, 8192),
         timeout_seconds=_integer("ZHIPUAI_TIMEOUT_SECONDS", 60, 5, 300),
         max_retries=_integer("ZHIPUAI_MAX_RETRIES", 2, 0, 5),
+        mode=os.getenv("AGENT_MODE", "autonomous").strip().casefold(),
+        max_steps=_integer("AGENT_MAX_STEPS", 6, 1, 12),
+        max_tool_calls=_integer("AGENT_MAX_TOOL_CALLS", 8, 1, 20),
+        turn_timeout_seconds=_integer("AGENT_TURN_TIMEOUT_SECONDS", 30, 5, 120),
     )

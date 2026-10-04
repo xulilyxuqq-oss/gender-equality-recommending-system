@@ -6,6 +6,7 @@ import json
 import httpx
 
 from backend.app.agent import generate_agent_reply
+from backend.app.agent import generate_agent_decision
 from backend.app.config import AgentSettings
 
 
@@ -85,3 +86,60 @@ def test_agent_is_not_called_without_api_key():
     )
     assert reply is None
     assert called is False
+
+
+def test_autonomous_adapter_parses_tool_call_and_sends_tool_schema():
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        assert body["tool_choice"] == "auto"
+        assert body["tools"][0]["function"]["name"] == "resolve_course"
+        return httpx.Response(200, json={
+            "choices": [{"message": {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {"name": "resolve_course", "arguments": '{"query":"Python"}'},
+                }],
+            }}]
+        })
+
+    decision = asyncio.run(generate_agent_decision(
+        context={"state": "COLLECTING_COURSES", "user_message": "Python"},
+        tools=[{"type": "function", "function": {
+            "name": "resolve_course", "description": "resolve", "parameters": {"type": "object"}
+        }}],
+        settings=settings(),
+        transport=httpx.MockTransport(handler),
+    ))
+
+    assert decision is not None
+    assert decision.tool_calls[0].name == "resolve_course"
+    assert decision.tool_calls[0].arguments == {"query": "Python"}
+
+
+def test_autonomous_adapter_returns_final_text():
+    transport = httpx.MockTransport(lambda request: httpx.Response(
+        200, json={"choices": [{"message": {"role": "assistant", "content": "请描述你学过的课程。"}}]}
+    ))
+    decision = asyncio.run(generate_agent_decision(
+        context={"state": "COLLECTING_COURSES", "user_message": "你好"},
+        tools=[], settings=settings(), transport=transport,
+    ))
+    assert decision is not None
+    assert decision.text == "请描述你学过的课程。"
+    assert decision.tool_calls == []
+
+
+def test_autonomous_adapter_rejects_malformed_tool_arguments():
+    transport = httpx.MockTransport(lambda request: httpx.Response(
+        200, json={"choices": [{"message": {"tool_calls": [{
+            "id": "call-1", "function": {"name": "resolve_course", "arguments": "not-json"}
+        }]}}]}
+    ))
+    decision = asyncio.run(generate_agent_decision(
+        context={"state": "COLLECTING_COURSES", "user_message": "Python"},
+        tools=[], settings=settings(), transport=transport,
+    ))
+    assert decision is None

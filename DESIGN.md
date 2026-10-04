@@ -210,3 +210,14 @@ components:
 - **Don't** 使用渐变文字、装饰性玻璃效果或霓虹光晕。
 - **Don't** 把性别公平统计暴露给普通用户。
 - **Don't** 用虚构客户、评价、准确率或商业指标填充 Demo。
+
+## Admin Console Extension
+
+管理端延续“课程编排台”，但进入更高密度的“教务观测台”模式。页面以连续工作纸、账册表格和检查面板组织信息，不使用等尺寸指标卡铺满页面。
+
+- **Admin surfaces**：`#EDF0EB` 为管理工作面，`#FAFCF8` 为工作纸，`#E4E9E3` 为表头和安静分区。
+- **Admin navigation**：`#101B17` 为主导航，`#1B2B25` 为次级深色表面；活动项仍由 Schedule Yellow 标识。
+- **Admin status ramp**：管理端可以使用主色的深浅派生值呈现状态文字，但黄色、薄荷绿、蓝色和珊瑚色的语义保持不变。
+- **Admin density**：管理表格使用 0.625–0.825rem 的 caption、label 和 small 字号；页面标题使用 1.8–3rem，登录主张可使用既有 Display 上限。
+- **Admin shapes**：密集状态标记可使用 6–9px 圆角；工作纸保持直角或最多 12px，检查面板使用真实阴影表达前后层级。
+- **Admin motion**：导航活动标记使用 transform，检查面板从右侧进入；数据和表格默认静止。

@@ -2,24 +2,51 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import copy
 import json
+import logging
 import re
+import sqlite3
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from datetime import timedelta
+from pathlib import Path
 from typing import Any, AsyncIterator
 
 import jwt
-from fastapi import Depends, FastAPI, Header, Query, Request, status
-from fastapi.exceptions import RequestValidationError
+from fastapi import APIRouter, Depends, FastAPI, Header, Query, Request, status
+from fastapi.concurrency import run_in_threadpool
 from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field, model_validator
 
 from .agent import generate_agent_reply
-from .catalog import catalog
-from .config import get_agent_settings
-from .store import iso, new_id, now, store
+from .admin import AdminService, build_admin_router
+from .agent_runtime.context import AgentContextBuilder
+from .agent_runtime.executor import ToolExecutor
+from .agent_runtime.loop import AgentLoop, AgentRunResult
+from .agent_runtime.policy import PolicyGuard
+from .agent_runtime.tools import build_course_tool_registry, register_write_tools
+from .catalog import CourseCatalog
+from .config import get_agent_settings, get_app_settings
+from .database import Database, validate_core_schema
+from .migrations import apply_migrations
+from .repositories import AcceptedChatTurn, ApplicationRepository, ChatTransition
+from .store import AuthService, new_id, now
+
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class AppServices:
+    database: Database
+    repository: ApplicationRepository
+    auth: AuthService
+    catalog: CourseCatalog
+    agent_runtime: AgentLoop | None = None
+    admin: AdminService | None = None
 
 
 class AppError(Exception):
@@ -31,27 +58,10 @@ class AppError(Exception):
 
 
 def error_payload(request: Request, code: str, message: str, details: dict[str, Any] | None = None) -> dict[str, Any]:
-    return {
-        "error": {
-            "code": code,
-            "message": message,
-            "details": details or {},
-            "request_id": getattr(request.state, "request_id", new_id("req")),
-        }
-    }
+    return {"error": {"code": code, "message": message, "details": details or {},
+                      "request_id": getattr(request.state, "request_id", new_id("req"))}}
 
 
-app = FastAPI(title="Course Compass API", version="0.1.0")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["http://127.0.0.1:4173", "http://localhost:4173"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-
-@app.middleware("http")
 async def request_context(request: Request, call_next):
     request.state.request_id = new_id("req")
     response = await call_next(request)
@@ -59,20 +69,28 @@ async def request_context(request: Request, call_next):
     return response
 
 
-@app.exception_handler(AppError)
 async def app_error_handler(request: Request, exc: AppError):
-    return JSONResponse(
-        status_code=exc.status_code,
-        content=error_payload(request, exc.code, exc.message, exc.details),
-    )
+    return JSONResponse(status_code=exc.status_code, content=error_payload(request, exc.code, exc.message, exc.details))
 
 
-@app.exception_handler(RequestValidationError)
 async def validation_error_handler(request: Request, exc: RequestValidationError):
-    return JSONResponse(
-        status_code=422,
-        content=jsonable_encoder(error_payload(request, "VALIDATION_ERROR", "请求字段不符合要求。", {"issues": exc.errors()})),
-    )
+    return JSONResponse(status_code=422, content=jsonable_encoder(
+        error_payload(request, "VALIDATION_ERROR", "请求字段不符合要求。", {"issues": exc.errors()})))
+
+
+async def database_error_handler(request: Request, exc: Exception):
+    if isinstance(exc, sqlite3.IntegrityError):
+        return JSONResponse(status_code=409, content=error_payload(
+            request, "DATA_CONFLICT", "数据状态冲突，请刷新后重试。"))
+    return JSONResponse(status_code=503, headers={"Retry-After": "1"}, content=error_payload(
+        request, "DATABASE_UNAVAILABLE", "数据库暂时不可用，请稍后重试。"))
+
+
+router = APIRouter()
+
+
+def get_services(request: Request) -> AppServices:
+    return request.app.state.services
 
 
 class Credentials(BaseModel):
@@ -131,89 +149,67 @@ class RecommendationCreate(BaseModel):
     top_n: int = Field(default=10, ge=1, le=50)
 
 
-def auth_response(account: dict[str, Any]) -> dict[str, Any]:
-    return {"account": store.public_account(account), **store.issue_tokens(account["account_id"])}
+def auth_response(services: AppServices, account: dict[str, Any]) -> dict[str, Any]:
+    return {"account": services.auth.public_account(account), **services.auth.issue_tokens(account["account_id"])}
 
 
-def account_id_from_header(authorization: str | None = Header(default=None)) -> str:
+def account_id_from_header(authorization: str | None = Header(default=None),
+                           services: AppServices = Depends(get_services)) -> str:
     if not authorization or not authorization.startswith("Bearer "):
         raise AppError(401, "AUTH_REQUIRED", "请先登录。")
-    token = authorization.removeprefix("Bearer ").strip()
     try:
-        return store.decode_access_token(token)
+        return services.auth.decode_access_token(authorization.removeprefix("Bearer ").strip())
     except jwt.ExpiredSignatureError as exc:
         raise AppError(401, "TOKEN_EXPIRED", "登录状态已过期，请重新登录。") from exc
     except jwt.InvalidTokenError as exc:
         raise AppError(401, "AUTH_REQUIRED", "登录凭据无效。") from exc
 
 
-def profile_for(account_id: str) -> dict[str, Any]:
-    return copy.deepcopy(store.profiles[account_id])
+def public_profile(profile: dict[str, Any]) -> dict[str, Any]:
+    return {key: profile[key] for key in (
+        "display_name", "gender_code", "completed_courses", "profile_version", "status", "confirmed_at")}
 
 
-def session_for(account_id: str, session_id: str) -> dict[str, Any]:
-    session = store.sessions.get(session_id)
-    if not session or session["account_id"] != account_id:
+def session_for(services: AppServices, account_id: str, session_id: str) -> dict[str, Any]:
+    session = services.repository.get_chat_session(account_id, session_id)
+    if session is None:
         raise AppError(404, "CHAT_SESSION_NOT_FOUND", "对话不存在。")
     return session
 
 
-def recommendation_for(account_id: str, recommendation_id: str) -> dict[str, Any]:
-    recommendation = store.recommendations.get(recommendation_id)
-    if not recommendation or recommendation["account_id"] != account_id or recommendation.get("deleted_at"):
-        raise AppError(404, "RECOMMENDATION_NOT_FOUND", "推荐记录不存在。")
-    return recommendation
-
-
-def course_summary(course_id: str) -> dict[str, Any]:
-    course = catalog.get(course_id)
-    if not course:
-        raise AppError(404, "COURSE_NOT_FOUND", "课程不存在。")
-    return {"course_id": course_id, "course_name": course["course_name"]}
-
-
-def create_resolution(account_id: str, session: dict[str, Any], query: str, limit: int = 5) -> dict[str, Any]:
-    resolution_id = new_id("res")
-    record = {
-        "resolution_id": resolution_id,
-        "account_id": account_id,
-        "chat_session_id": session["chat_session_id"],
-        "query": query,
-        "status": "PENDING",
-        "selected_course_id": None,
-        "expires_at": now() + timedelta(minutes=30),
-        "candidates": catalog.resolve(query, limit),
-    }
-    store.resolutions[resolution_id] = record
-    session["resolution_ids"].append(resolution_id)
-    return public_resolution(record)
-
-
-def public_resolution(record: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "resolution_id": record["resolution_id"],
-        "query": record["query"],
-        "status": record["status"],
-        "selected_course_id": record.get("selected_course_id"),
-        "expires_at": iso(record["expires_at"]),
-        "candidates": copy.deepcopy(record["candidates"]),
-    }
-
-
 def public_session(session: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "chat_session_id": session["chat_session_id"],
-        "state": session["state"],
-        "profile_version": session["profile_version"],
-        "profile_draft": copy.deepcopy(session["profile_draft"]),
-        "messages": copy.deepcopy(session["messages"]),
-        "course_resolutions": [
-            public_resolution(store.resolutions[item])
-            for item in session["resolution_ids"]
-            if item in store.resolutions
-        ],
-        "created_at": session["created_at"],
+    return {key: session[key] for key in (
+        "chat_session_id", "state", "profile_version", "profile_draft", "messages", "course_resolutions", "created_at")}
+
+
+def version_conflict(services: AppServices, account_id: str, received: int) -> AppError:
+    profile = services.repository.get_profile(account_id)
+    return AppError(409, "PROFILE_VERSION_CONFLICT", "用户画像已被更新，请刷新后重试。",
+                    {"expected_version": profile["profile_version"], "received_version": received})
+
+
+def domain_error(exc: ValueError, services: AppServices, account_id: str, version: int = 0) -> AppError:
+    if str(exc) == "profile version conflict":
+        return version_conflict(services, account_id, version)
+    errors = {
+        "pending course resolutions": (409, "PENDING_COURSE_RESOLUTIONS", "请先处理全部课程匹配。"),
+        "profile incomplete": (409, "PROFILE_INCOMPLETE", "姓名或性别尚未填写完整。"),
+        "invalid draft course": (404, "COURSE_NOT_FOUND", "课程不存在。"),
+        "invalid display name": (422, "VALIDATION_ERROR", "姓名不能为空。"),
+        "invalid gender code": (422, "VALIDATION_ERROR", "性别字段只支持 1 或 2。"),
+        "resolution expired": (409, "RESOLUTION_EXPIRED", "课程候选已过期，请重新描述。"),
+        "resolution already finalized": (409, "RESOLUTION_ALREADY_FINALIZED", "该课程描述已经处理。"),
+        "invalid resolution candidate": (400, "INVALID_RESOLUTION_CANDIDATE", "确认的课程不在候选集合中。"),
     }
+    if str(exc) not in errors:
+        raise exc
+    return AppError(*errors[str(exc)])
+
+
+def create_resolution(services: AppServices, account_id: str, session_id: str,
+                      query: str, limit: int = 5) -> dict[str, Any]:
+    return services.repository.create_resolution(
+        account_id, session_id, query, services.catalog.resolve(query, limit), now() + timedelta(minutes=30))
 
 
 def split_course_descriptions(message: str) -> list[str]:
@@ -230,466 +226,507 @@ def decode_cursor(cursor: str | None) -> int:
     if not cursor:
         return 0
     try:
-        padded = cursor + "=" * (-len(cursor) % 4)
-        return max(0, int(base64.urlsafe_b64decode(padded).decode()))
+        return max(0, int(base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4)).decode()))
     except (ValueError, UnicodeDecodeError):
         raise AppError(400, "INVALID_CURSOR", "分页游标无效。")
 
 
-@app.get("/api/v1/health")
-def health() -> dict[str, str]:
+def page_response(items: list[dict[str, Any]], has_more: bool, offset: int, limit: int) -> dict[str, Any]:
+    return {"items": items, "next_cursor": encode_cursor(offset + limit) if has_more else None, "has_more": has_more}
+
+
+@router.get("/api/v1/health")
+def health(services: AppServices = Depends(get_services)) -> dict[str, Any]:
+    with services.database.connect() as connection:
+        connection.execute("SELECT 1").fetchone()
+        version = connection.execute("SELECT COALESCE(MAX(version), 0) FROM schema_migrations").fetchone()[0]
     agent_settings = get_agent_settings()
-    return {
-        "status": "ok",
-        "storage": "memory",
-        "agent_mode": "zhipuai" if agent_settings.configured else "rules_fallback",
-        "agent_model": agent_settings.model if agent_settings.configured else "rules",
-    }
+    return {"status": "ok", "storage": "sqlite", "database_check": "ok", "database_schema_version": version,
+            "agent_mode": "zhipuai" if agent_settings.configured else "rules_fallback",
+            "agent_model": agent_settings.model if agent_settings.configured else "rules"}
 
 
-@app.post("/api/v1/auth/register", status_code=status.HTTP_201_CREATED)
-def register(payload: Credentials):
+@router.post("/api/v1/auth/register", status_code=status.HTTP_201_CREATED)
+def register(payload: Credentials, services: AppServices = Depends(get_services)):
     if not payload.username.strip():
         raise AppError(422, "VALIDATION_ERROR", "用户名不能为空。")
     try:
-        account = store.create_account(payload.username.strip(), payload.password)
+        account = services.auth.create_account(payload.username.strip(), payload.password)
     except ValueError as exc:
+        if str(exc) != "duplicate username":
+            raise
         raise AppError(409, "USERNAME_EXISTS", "该用户名已被使用。") from exc
-    return auth_response(account)
+    return auth_response(services, account)
 
 
-@app.post("/api/v1/auth/login")
-def login(payload: Credentials):
-    account = store.authenticate(payload.username.strip(), payload.password)
+@router.post("/api/v1/auth/login")
+def login(payload: Credentials, services: AppServices = Depends(get_services)):
+    account = services.auth.authenticate(payload.username.strip(), payload.password)
     if not account:
         raise AppError(401, "AUTH_INVALID_CREDENTIALS", "用户名或密码错误。")
-    return auth_response(account)
+    return auth_response(services, account)
 
 
-@app.post("/api/v1/auth/refresh")
-def refresh(payload: RefreshRequest):
-    record = store.refresh_tokens.get(payload.refresh_token)
-    if not record or record["revoked"] or record["expires_at"] <= now():
+@router.post("/api/v1/auth/refresh")
+def refresh(payload: RefreshRequest, services: AppServices = Depends(get_services)):
+    tokens = services.auth.refresh(payload.refresh_token)
+    if tokens is None:
         raise AppError(401, "TOKEN_EXPIRED", "刷新令牌无效或已过期。")
-    record["revoked"] = True
-    account = store.accounts[record["account_id"]]
-    return auth_response(account)
+    account_id = services.auth.decode_access_token(tokens["access_token"])
+    account = services.repository.get_account(account_id)
+    return {"account": services.auth.public_account(account), **tokens}
 
 
-@app.post("/api/v1/auth/logout", status_code=status.HTTP_204_NO_CONTENT)
-def logout(payload: RefreshRequest):
-    record = store.refresh_tokens.get(payload.refresh_token)
-    if record:
-        record["revoked"] = True
+@router.post("/api/v1/auth/logout", status_code=status.HTTP_204_NO_CONTENT)
+def logout(payload: RefreshRequest, services: AppServices = Depends(get_services)):
+    services.auth.logout(payload.refresh_token)
     return Response(status_code=204)
 
 
-@app.get("/api/v1/me/profile")
-def get_profile(account_id: str = Depends(account_id_from_header)):
-    return profile_for(account_id)
+@router.get("/api/v1/me/profile")
+def get_profile(account_id: str = Depends(account_id_from_header), services: AppServices = Depends(get_services)):
+    return public_profile(services.repository.get_profile(account_id))
 
 
-@app.patch("/api/v1/me/profile")
-def patch_profile(payload: ProfilePatch, account_id: str = Depends(account_id_from_header)):
-    profile = store.profiles[account_id]
+@router.patch("/api/v1/me/profile")
+def patch_profile(payload: ProfilePatch, account_id: str = Depends(account_id_from_header),
+                  services: AppServices = Depends(get_services)):
+    profile = services.repository.get_profile(account_id)
     if payload.profile_version != profile["profile_version"]:
-        raise AppError(
-            409,
-            "PROFILE_VERSION_CONFLICT",
-            "用户画像已被更新，请刷新后重试。",
-            {"expected_version": profile["profile_version"], "received_version": payload.profile_version},
-        )
+        raise version_conflict(services, account_id, payload.profile_version)
     if payload.gender_code is not None and payload.gender_code not in (1, 2):
         raise AppError(422, "VALIDATION_ERROR", "性别字段只支持 1 或 2。")
-    if payload.display_name is not None:
-        display_name = payload.display_name.strip()
-        if not display_name:
-            raise AppError(422, "VALIDATION_ERROR", "姓名不能为空。")
-        profile["display_name"] = display_name
-    if payload.gender_code is not None:
-        profile["gender_code"] = payload.gender_code
-    profile["profile_version"] += 1
-    profile["status"] = "DRAFT"
-    return profile_for(account_id)
+    name = payload.display_name.strip() if payload.display_name is not None else None
+    if name == "":
+        raise AppError(422, "VALIDATION_ERROR", "姓名不能为空。")
+    try:
+        return public_profile(services.repository.patch_profile(account_id, payload.profile_version, name, payload.gender_code))
+    except ValueError as exc:
+        raise domain_error(exc, services, account_id, payload.profile_version) from exc
 
 
-@app.get("/api/v1/me/completed-courses")
-def completed_courses(account_id: str = Depends(account_id_from_header)):
-    return {"items": profile_for(account_id)["completed_courses"]}
+@router.get("/api/v1/me/completed-courses")
+def completed_courses(account_id: str = Depends(account_id_from_header), services: AppServices = Depends(get_services)):
+    return {"items": services.repository.get_profile(account_id)["completed_courses"]}
 
 
-@app.post("/api/v1/me/profile/confirm")
-def confirm_profile(payload: ProfileConfirm, account_id: str = Depends(account_id_from_header)):
-    session = session_for(account_id, payload.chat_session_id)
-    profile = store.profiles[account_id]
-    if payload.profile_version != profile["profile_version"]:
-        raise AppError(
-            409,
-            "PROFILE_VERSION_CONFLICT",
-            "用户画像已被更新，请刷新后重试。",
-            {"expected_version": profile["profile_version"], "received_version": payload.profile_version},
-        )
-    pending = [item for item in session["resolution_ids"] if store.resolutions[item]["status"] == "PENDING"]
-    if pending or session["state"] != "PROFILE_REVIEW":
-        raise AppError(409, "PENDING_COURSE_RESOLUTIONS", "请先处理全部课程匹配。")
-    draft = session["profile_draft"]
-    if not draft["display_name"] or draft["gender_code"] not in (1, 2):
-        raise AppError(409, "PROFILE_INCOMPLETE", "姓名或性别尚未填写完整。")
-    profile.update(copy.deepcopy(draft))
-    profile["profile_version"] += 1
-    profile["status"] = "CONFIRMED"
-    profile["confirmed_at"] = iso()
-    session["profile_version"] = profile["profile_version"]
-    session["state"] = "COMPLETED"
-    return profile_for(account_id)
+@router.post("/api/v1/me/profile/confirm")
+def confirm_profile(payload: ProfileConfirm, account_id: str = Depends(account_id_from_header),
+                    services: AppServices = Depends(get_services)):
+    session_for(services, account_id, payload.chat_session_id)
+    try:
+        return public_profile(services.repository.confirm_profile(account_id, payload.chat_session_id, payload.profile_version))
+    except ValueError as exc:
+        raise domain_error(exc, services, account_id, payload.profile_version) from exc
 
 
-@app.get("/api/v1/courses")
-def list_courses(
-    q: str = "",
-    cursor: str | None = None,
-    limit: int = Query(default=20, ge=1, le=50),
-    account_id: str = Depends(account_id_from_header),
-):
-    del account_id
+@router.get("/api/v1/courses")
+def list_courses(q: str = "", cursor: str | None = None, limit: int = Query(default=20, ge=1, le=50),
+                 account_id: str = Depends(account_id_from_header), services: AppServices = Depends(get_services)):
     offset = decode_cursor(cursor)
-    results = catalog.search(q, offset + limit + 1)[offset:]
-    items = results[:limit]
-    has_more = len(results) > limit
-    return {"items": items, "next_cursor": encode_cursor(offset + limit) if has_more else None, "has_more": has_more}
+    results = services.catalog.search(q, offset + limit + 1)[offset:]
+    return page_response(results[:limit], len(results) > limit, offset, limit)
 
 
-@app.get("/api/v1/courses/{course_id}")
-def course_details(course_id: str, account_id: str = Depends(account_id_from_header)):
-    course = catalog.get(course_id)
+@router.get("/api/v1/courses/{course_id}")
+def course_details(course_id: str, account_id: str = Depends(account_id_from_header),
+                   services: AppServices = Depends(get_services)):
+    course = services.catalog.get(course_id)
     if not course:
         raise AppError(404, "COURSE_NOT_FOUND", "课程不存在。")
-    completed = {item["course_id"] for item in store.profiles[account_id]["completed_courses"]}
-    return {
-        **catalog.public_course(course),
-        "advanced_label_rule": course["advanced_label_rule"],
-        "prerequisites": course["prerequisites"],
-        "prerequisites_satisfied": all(item["course_id"] in completed for item in course["prerequisites"]),
-        "is_favorite": course_id in store.favorites[account_id],
-    }
+    completed = {item["course_id"] for item in services.repository.get_profile(account_id)["completed_courses"]}
+    favorites, _ = services.repository.list_favorites(account_id, 0, len(services.catalog.courses))
+    return {**services.catalog.public_course(course), "advanced_label_rule": course["advanced_label_rule"],
+            "prerequisites": course["prerequisites"],
+            "prerequisites_satisfied": all(item["course_id"] in completed for item in course["prerequisites"]),
+            "is_favorite": any(item["course"]["course_id"] == course_id for item in favorites)}
 
 
-@app.post("/api/v1/courses/resolve", status_code=status.HTTP_201_CREATED)
-def resolve_course(payload: ResolveRequest, account_id: str = Depends(account_id_from_header)):
-    session = session_for(account_id, payload.chat_session_id)
-    return create_resolution(account_id, session, payload.query, payload.limit)
+@router.post("/api/v1/courses/resolve", status_code=status.HTTP_201_CREATED)
+def resolve_course(payload: ResolveRequest, account_id: str = Depends(account_id_from_header),
+                   services: AppServices = Depends(get_services)):
+    session_for(services, account_id, payload.chat_session_id)
+    return create_resolution(services, account_id, payload.chat_session_id, payload.query, payload.limit)
 
 
-@app.post("/api/v1/chat/sessions", status_code=status.HTTP_201_CREATED)
-def create_session(payload: SessionCreate, account_id: str = Depends(account_id_from_header)):
+@router.post("/api/v1/chat/sessions", status_code=status.HTTP_201_CREATED)
+def create_session(payload: SessionCreate, account_id: str = Depends(account_id_from_header),
+                   services: AppServices = Depends(get_services)):
     if payload.purpose != "RECOMMENDATION":
         raise AppError(400, "INVALID_SESSION_PURPOSE", "暂不支持该会话类型。")
-    profile = profile_for(account_id)
-    session_id = new_id("chat")
-    draft = {
-        "display_name": profile["display_name"],
-        "gender_code": profile["gender_code"],
-        "completed_courses": profile["completed_courses"],
-    }
-    if not draft["display_name"]:
-        state_name = "COLLECTING_NAME"
-        greeting = "你好，我是课程路径助手。先告诉我应该怎么称呼你。"
-    elif draft["gender_code"] not in (1, 2):
-        state_name = "COLLECTING_GENDER"
-        greeting = "继续完善画像，请选择当前模型支持的性别数据组。"
-    else:
-        state_name = "COLLECTING_COURSES"
-        greeting = "请用自然语言描述你学过的课程，可以一次说一门或多门。"
-    session = {
-        "chat_session_id": session_id,
-        "account_id": account_id,
-        "state": state_name,
-        "profile_version": profile["profile_version"],
-        "profile_draft": draft,
-        "messages": [{"message_id": new_id("msg"), "role": "assistant", "content": greeting, "created_at": iso()}],
-        "resolution_ids": [],
-        "client_message_ids": set(),
-        "event_seq": 0,
-        "created_at": iso(),
-    }
-    store.sessions[session_id] = session
-    return public_session(session)
+    return public_session(services.repository.create_chat_session(account_id, payload.purpose))
 
 
-@app.get("/api/v1/chat/sessions/{chat_session_id}")
-def get_session(chat_session_id: str, account_id: str = Depends(account_id_from_header)):
-    return public_session(session_for(account_id, chat_session_id))
+@router.get("/api/v1/chat/sessions/{chat_session_id}")
+def get_session(chat_session_id: str, account_id: str = Depends(account_id_from_header),
+                services: AppServices = Depends(get_services)):
+    return public_session(session_for(services, account_id, chat_session_id))
 
 
-@app.patch("/api/v1/chat/sessions/{chat_session_id}/profile-draft")
-def patch_profile_draft(
-    chat_session_id: str,
-    payload: DraftProfilePatch,
-    account_id: str = Depends(account_id_from_header),
-):
-    session = session_for(account_id, chat_session_id)
-    if payload.gender_code is not None and payload.gender_code not in (1, 2):
-        raise AppError(422, "VALIDATION_ERROR", "性别字段只支持 1 或 2。")
-    if payload.display_name is not None:
-        display_name = payload.display_name.strip()
-        if not display_name:
-            raise AppError(422, "VALIDATION_ERROR", "姓名不能为空。")
-        session["profile_draft"]["display_name"] = display_name
-    if payload.gender_code is not None:
-        session["profile_draft"]["gender_code"] = payload.gender_code
-    if session["profile_draft"]["display_name"] and session["profile_draft"]["gender_code"] in (1, 2):
-        pending = [item for item in session["resolution_ids"] if store.resolutions[item]["status"] == "PENDING"]
-        session["state"] = "WAITING_COURSE_CONFIRMATION" if pending else "PROFILE_REVIEW"
-    return public_session(session)
+@router.patch("/api/v1/chat/sessions/{chat_session_id}/profile-draft")
+def patch_profile_draft(chat_session_id: str, payload: DraftProfilePatch,
+                        account_id: str = Depends(account_id_from_header), services: AppServices = Depends(get_services)):
+    session_for(services, account_id, chat_session_id)
+    try:
+        return public_session(services.repository.patch_session_draft(
+            account_id, chat_session_id, payload.display_name, payload.gender_code))
+    except ValueError as exc:
+        raise domain_error(exc, services, account_id) from exc
 
 
-@app.delete(
-    "/api/v1/chat/sessions/{chat_session_id}/profile-draft/completed-courses/{course_id}",
-    status_code=status.HTTP_200_OK,
-)
-def remove_draft_course(
-    chat_session_id: str,
-    course_id: str,
-    account_id: str = Depends(account_id_from_header),
-):
-    session = session_for(account_id, chat_session_id)
-    session["profile_draft"]["completed_courses"] = [
-        item for item in session["profile_draft"]["completed_courses"] if item["course_id"] != course_id
-    ]
-    return public_session(session)
+@router.delete("/api/v1/chat/sessions/{chat_session_id}/profile-draft/completed-courses/{course_id}",
+               status_code=status.HTTP_200_OK)
+def remove_draft_course(chat_session_id: str, course_id: str, account_id: str = Depends(account_id_from_header),
+                        services: AppServices = Depends(get_services)):
+    session_for(services, account_id, chat_session_id)
+    return public_session(services.repository.remove_session_course(account_id, chat_session_id, course_id))
 
 
-def sse_event(session: dict[str, Any], event: str, data: dict[str, Any]) -> str:
-    session["event_seq"] += 1
-    return f"id: evt_{session['event_seq']:06d}\nevent: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+def sse_event(sequence: int, event: str, data: dict[str, Any]) -> str:
+    return f"id: evt_{sequence:06d}\nevent: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
-async def stream_reply(account_id: str, session: dict[str, Any], payload: MessageCreate) -> AsyncIterator[str]:
-    if payload.client_message_id in session["client_message_ids"]:
-        yield sse_event(session, "done", {"chat_session_id": session["chat_session_id"], "duplicate": True})
-        return
-    session["client_message_ids"].add(payload.client_message_id)
-    session["messages"].append(
-        {"message_id": new_id("msg"), "role": "user", "content": payload.message, "created_at": iso()}
-    )
-    message = payload.message.strip()
-    response_text = ""
-    extra_events: list[tuple[str, dict[str, Any]]] = []
-
-    if session["state"] == "COLLECTING_NAME":
-        session["profile_draft"]["display_name"] = message[:80]
-        session["state"] = "COLLECTING_GENDER"
+def prepare_chat_transition(catalog: CourseCatalog, session: dict[str, Any], content: str) -> ChatTransition:
+    """Plan from the repository's locked session snapshot using only cached metadata."""
+    message = content.strip()
+    state = session["state"]
+    name = session["profile_draft"]["display_name"]
+    gender = session["profile_draft"]["gender_code"]
+    profile_event = None
+    resolutions = []
+    if state == "COLLECTING_NAME":
+        name, state = message[:80], "COLLECTING_GENDER"
         response_text = f"好的，{message[:80]}。请选择性别数据组，系统不会根据姓名推断。"
-        extra_events.append(("profile.updated", {"profile_draft": session["profile_draft"], "state": session["state"]}))
-    elif session["state"] == "COLLECTING_GENDER":
-        gender = 1 if message in {"1", "男", "男性"} else 2 if message in {"2", "女", "女性"} else None
-        if gender is None:
+        profile_event = "profile.updated"
+    elif state == "COLLECTING_GENDER":
+        selected_gender = 1 if message in {"1", "男", "男性"} else 2 if message in {"2", "女", "女性"} else None
+        if selected_gender is None:
             response_text = "请明确选择男或女。这个字段只用于当前数据集与公平算法。"
         else:
-            session["profile_draft"]["gender_code"] = gender
-            session["state"] = "COLLECTING_COURSES"
+            gender, state = selected_gender, "COLLECTING_COURSES"
             response_text = "已记录。现在请描述你学过的课程，可以一次说多门。"
-            extra_events.append(("profile.updated", {"profile_draft": session["profile_draft"], "state": session["state"]}))
-    elif session["state"] in {"COLLECTING_COURSES", "PROFILE_REVIEW"}:
+            profile_event = "profile.updated"
+    elif state in {"COLLECTING_COURSES", "PROFILE_REVIEW"}:
         if any(term in message for term in ("没有学过", "没有其他", "暂时没有", "跳过课程", "完成课程")):
-            pending = [item for item in session["resolution_ids"] if store.resolutions[item]["status"] == "PENDING"]
-            if pending:
+            if any(item["status"] == "PENDING" for item in session["course_resolutions"]):
                 response_text = "还有课程候选尚未处理，请先确认或选择都不是。"
             else:
-                session["state"] = "PROFILE_REVIEW"
+                state = "PROFILE_REVIEW"
                 response_text = "课程信息已经整理完成，请检查画像后确认生成推荐。"
-                extra_events.append(("profile.ready", {"profile_draft": session["profile_draft"], "state": session["state"]}))
+                profile_event = "profile.ready"
         else:
-            descriptions = split_course_descriptions(message)
-            records = [create_resolution(account_id, session, item) for item in descriptions]
-            session["state"] = "WAITING_COURSE_CONFIRMATION"
-            response_text = f"我识别出 {len(records)} 项课程描述，请逐项核对候选。"
-            extra_events.extend(("course.match_required", record) for record in records)
-    elif session["state"] == "WAITING_COURSE_CONFIRMATION":
+            resolutions = [(query, catalog.resolve(query)) for query in split_course_descriptions(message)]
+            state = "WAITING_COURSE_CONFIRMATION"
+            response_text = f"我识别出 {len(resolutions)} 项课程描述，请逐项核对候选。"
+    elif state == "WAITING_COURSE_CONFIRMATION":
         response_text = "请先使用课程确认卡处理全部候选。"
     else:
         response_text = "本轮画像已经确认，可以查看推荐结果或创建新会话。"
+    return ChatTransition(state, name, gender, response_text, profile_event, resolutions)
 
-    generated_reply = await generate_agent_reply(
-        state=session["state"],
-        user_message=message,
-        authoritative_reply=response_text,
-    )
-    response_text = generated_reply or response_text
-    session["messages"].append(
-        {"message_id": new_id("msg"), "role": "assistant", "content": response_text, "created_at": iso()}
-    )
+
+def prepare_stream_frames(turn: AcceptedChatTurn, response_text: str) -> list[str]:
+    session, transition = turn.session, turn.transition
+    session_id = session["chat_session_id"]
+    if transition is None:
+        return [sse_event(turn.event_sequences[0], "done", {"chat_session_id": session_id, "duplicate": True})]
     midpoint = max(1, len(response_text) // 2)
-    for chunk in (response_text[:midpoint], response_text[midpoint:]):
-        if chunk:
-            yield sse_event(session, "message.delta", {"text": chunk})
-            await asyncio.sleep(0.03)
-    for event, data in extra_events:
-        yield sse_event(session, event, data)
-    yield sse_event(session, "done", {"chat_session_id": session["chat_session_id"]})
+    events = [("message.delta", {"text": chunk})
+              for chunk in (response_text[:midpoint], response_text[midpoint:]) if chunk]
+    events.extend(("course.match_required", record) for record in turn.resolutions)
+    if transition.profile_event:
+        events.append((transition.profile_event, {"profile_draft": session["profile_draft"], "state": session["state"]}))
+    events.append(("done", {"chat_session_id": session_id}))
+    return [sse_event(sequence, event, data) for sequence, (event, data) in zip(turn.event_sequences, events)]
 
 
-@app.post("/api/v1/chat/sessions/{chat_session_id}/messages:stream")
-def send_message(
-    chat_session_id: str,
-    payload: MessageCreate,
-    account_id: str = Depends(account_id_from_header),
-):
-    session = session_for(account_id, chat_session_id)
-    return StreamingResponse(stream_reply(account_id, session, payload), media_type="text/event-stream")
+async def stream_reply(frames: list[str]) -> AsyncIterator[str]:
+    """All persistence and event formatting finish before response headers are sent."""
+    for frame in frames:
+        yield frame
+        await asyncio.sleep(0.03)
 
 
-@app.post("/api/v1/chat/sessions/{chat_session_id}/course-resolutions/{resolution_id}")
-def decide_resolution(
-    chat_session_id: str,
-    resolution_id: str,
-    payload: ResolutionDecision,
-    account_id: str = Depends(account_id_from_header),
-):
-    session = session_for(account_id, chat_session_id)
-    record = store.resolutions.get(resolution_id)
-    if not record or record["account_id"] != account_id or record["chat_session_id"] != chat_session_id:
-        raise AppError(404, "RESOLUTION_NOT_FOUND", "课程解析不存在。")
-    if record["expires_at"] <= now():
-        record["status"] = "EXPIRED"
-        raise AppError(409, "RESOLUTION_EXPIRED", "课程候选已过期，请重新描述。")
-    if record["status"] != "PENDING":
-        same = payload.course_id and payload.course_id == record.get("selected_course_id")
-        if same or (payload.rejected and record["status"] == "REJECTED"):
-            return public_session(session)
-        raise AppError(409, "RESOLUTION_ALREADY_FINALIZED", "该课程描述已经处理。")
+async def stream_agent_reply(
+    services: AppServices,
+    account_id: str,
+    session_id: str,
+    message: str,
+    client_message_id: str,
+) -> AsyncIterator[str]:
+    """Stream safe Agent progress first, then the final assistant response."""
+    queue: asyncio.Queue[tuple[str, dict[str, Any]] | None] = asyncio.Queue()
+    outcome: dict[str, Any] = {}
 
-    if payload.course_id:
-        candidate_ids = {item["course_id"] for item in record["candidates"]}
-        if payload.course_id not in candidate_ids:
-            raise AppError(400, "INVALID_RESOLUTION_CANDIDATE", "确认的课程不在候选集合中。")
-        record["status"] = "CONFIRMED"
-        record["selected_course_id"] = payload.course_id
-        course = course_summary(payload.course_id)
-        existing = {item["course_id"] for item in session["profile_draft"]["completed_courses"]}
-        if payload.course_id not in existing:
-            session["profile_draft"]["completed_courses"].append(course)
-    else:
-        record["status"] = "REJECTED"
+    async def emit(event: str, data: dict[str, Any]) -> None:
+        await queue.put((event, data))
 
-    pending = [item for item in session["resolution_ids"] if store.resolutions[item]["status"] == "PENDING"]
-    rejected = [item for item in session["resolution_ids"] if store.resolutions[item]["status"] == "REJECTED"]
-    if pending:
-        session["state"] = "WAITING_COURSE_CONFIRMATION"
-    elif rejected:
-        session["state"] = "COLLECTING_COURSES"
-        session["messages"].append(
-            {"message_id": new_id("msg"), "role": "assistant", "content": "未匹配的课程可以换一种说法，或选择完成课程描述。", "created_at": iso()}
+    async def run_agent() -> None:
+        try:
+            outcome["result"] = await services.agent_runtime.run(
+                account_id, session_id, message, client_message_id, emit=emit
+            )
+        except BaseException as exc:
+            outcome["error"] = exc
+        finally:
+            await queue.put(None)
+
+    task = asyncio.create_task(run_agent())
+    while True:
+        item = await queue.get()
+        if item is None:
+            break
+        event, data = item
+        sequence = await run_in_threadpool(
+            services.repository.next_event_sequence, account_id, session_id
         )
-    else:
-        session["state"] = "PROFILE_REVIEW"
-        session["messages"].append(
-            {"message_id": new_id("msg"), "role": "assistant", "content": "候选都已确认，请检查画像并生成推荐。", "created_at": iso()}
+        yield sse_event(sequence, event, data)
+
+    await task
+    if "error" in outcome:
+        raise outcome["error"]
+    result: AgentRunResult = outcome["result"]
+    if result.duplicate:
+        for event, data in result.events or [("done", {"chat_session_id": session_id, "duplicate": True})]:
+            sequence = await run_in_threadpool(
+                services.repository.next_event_sequence, account_id, session_id
+            )
+            yield sse_event(sequence, event, data)
+        return
+    if result.text:
+        midpoint = max(1, len(result.text) // 2)
+        for chunk in (result.text[:midpoint], result.text[midpoint:]):
+            if chunk:
+                sequence = await run_in_threadpool(
+                    services.repository.next_event_sequence, account_id, session_id
+                )
+                yield sse_event(sequence, "message.delta", {"text": chunk})
+                await asyncio.sleep(0.03)
+    for event, data in result.events or []:
+        sequence = await run_in_threadpool(
+            services.repository.next_event_sequence, account_id, session_id
         )
-    return public_session(session)
+        yield sse_event(sequence, event, data)
+    sequence = await run_in_threadpool(
+        services.repository.next_event_sequence, account_id, session_id
+    )
+    yield sse_event(sequence, "done", {"chat_session_id": session_id})
 
 
-@app.post("/api/v1/recommendations", status_code=status.HTTP_201_CREATED)
-def create_recommendation(payload: RecommendationCreate, account_id: str = Depends(account_id_from_header)):
-    profile = store.profiles[account_id]
+def prepare_agent_stream_frames(
+    services: AppServices, account_id: str, session_id: str, result: AgentRunResult
+) -> list[str]:
+    if result.duplicate:
+        events = result.events or [("done", {"chat_session_id": session_id, "duplicate": True})]
+    else:
+        events: list[tuple[str, dict[str, Any]]] = []
+        if result.text:
+            midpoint = max(1, len(result.text) // 2)
+            events.extend(
+                ("message.delta", {"text": chunk})
+                for chunk in (result.text[:midpoint], result.text[midpoint:])
+                if chunk
+            )
+        events.extend(result.events or [])
+        events.append(("done", {"chat_session_id": session_id}))
+    sequences = [services.repository.next_event_sequence(account_id, session_id) for _ in events]
+    return [sse_event(sequence, event, data) for sequence, (event, data) in zip(sequences, events)]
+
+
+def autonomous_runtime_enabled(services: AppServices) -> bool:
+    runtime = services.agent_runtime
+    settings = get_agent_settings()
+    return runtime is not None and settings.mode == "autonomous"
+
+
+@router.post("/api/v1/chat/sessions/{chat_session_id}/messages:stream")
+async def send_message(chat_session_id: str, payload: MessageCreate, account_id: str = Depends(account_id_from_header),
+                       services: AppServices = Depends(get_services)):
+    if autonomous_runtime_enabled(services):
+        return StreamingResponse(
+            stream_agent_reply(
+                services, account_id, chat_session_id, payload.message, payload.client_message_id
+            ),
+            media_type="text/event-stream",
+        )
+    try:
+        turn = await run_in_threadpool(services.repository.accept_chat_message,
+            account_id, chat_session_id, payload.message, payload.client_message_id,
+            lambda current: prepare_chat_transition(services.catalog, current, payload.message),
+        )
+    except KeyError as exc:
+        raise AppError(404, "CHAT_SESSION_NOT_FOUND", "对话不存在。") from exc
+    response_text = turn.transition.reply if turn.transition is not None else ""
+    if turn.transition is not None:
+        generated_reply = await generate_agent_reply(state=turn.session["state"], user_message=payload.message.strip(),
+                                                     authoritative_reply=response_text)
+        if generated_reply and generated_reply != response_text:
+            try:
+                await run_in_threadpool(services.repository.update_assistant_reply,
+                    account_id, chat_session_id, turn.assistant_message["message_id"], generated_reply)
+            except (sqlite3.Error, OSError) as exc:
+                # The accepted fallback and event IDs already committed together.
+                logger.warning("回复润色未能保存，使用已持久化的规则回复。error_type=%s", type(exc).__name__)
+            else:
+                response_text = generated_reply
+    frames = prepare_stream_frames(turn, response_text)
+    return StreamingResponse(stream_reply(frames), media_type="text/event-stream")
+
+
+@router.post("/api/v1/chat/sessions/{chat_session_id}/course-resolutions/{resolution_id}")
+def decide_resolution(chat_session_id: str, resolution_id: str, payload: ResolutionDecision,
+                      account_id: str = Depends(account_id_from_header), services: AppServices = Depends(get_services)):
+    session_for(services, account_id, chat_session_id)
+    try:
+        return public_session(services.repository.decide_resolution(
+            account_id, chat_session_id, resolution_id, payload.course_id, bool(payload.rejected)))
+    except KeyError as exc:
+        raise AppError(404, "RESOLUTION_NOT_FOUND", "课程解析不存在。") from exc
+    except ValueError as exc:
+        raise domain_error(exc, services, account_id) from exc
+
+
+@router.post("/api/v1/recommendations", status_code=status.HTTP_201_CREATED)
+def create_recommendation(payload: RecommendationCreate, account_id: str = Depends(account_id_from_header),
+                          services: AppServices = Depends(get_services)):
+    profile = services.repository.get_profile(account_id)
     if profile["status"] != "CONFIRMED":
         raise AppError(409, "PROFILE_NOT_CONFIRMED", "请先确认用户画像。")
     if payload.profile_version != profile["profile_version"]:
-        raise AppError(
-            409,
-            "PROFILE_VERSION_CONFLICT",
-            "用户画像已被更新，请刷新后重试。",
-            {"expected_version": profile["profile_version"], "received_version": payload.profile_version},
+        raise version_conflict(services, account_id, payload.profile_version)
+    source, items = services.catalog.recommendations(profile["user_id"], payload.top_n)
+    fairness_policy_version = None
+    if services.admin is not None:
+        items, fairness_policy_version = services.admin.apply_active_policy(items, profile["gender_code"])
+    try:
+        return services.repository.save_recommendation(
+            account_id, profile["user_id"], profile["profile_version"], source, items,
+            fairness_policy_version=fairness_policy_version,
         )
-    completed = [item["course_id"] for item in profile["completed_courses"]]
-    source, items = catalog.recommendations(completed, payload.top_n)
-    recommendation_id = new_id("rec")
-    record = {
-        "recommendation_id": recommendation_id,
-        "account_id": account_id,
-        "source": source,
-        "algorithm_version": "user-cf-memory-v1",
-        "fairness_applied": False,
-        "fairness_policy_version": None,
-        "generated_at": iso(),
-        "items": items,
-        "deleted_at": None,
-    }
-    store.recommendations[recommendation_id] = record
-    return copy.deepcopy({key: value for key, value in record.items() if key not in {"account_id", "deleted_at"}})
+    except ValueError as exc:
+        raise domain_error(exc, services, account_id, payload.profile_version) from exc
 
 
-@app.get("/api/v1/recommendations")
-def list_recommendations(
-    cursor: str | None = None,
-    limit: int = Query(default=20, ge=1, le=50),
-    account_id: str = Depends(account_id_from_header),
-):
+@router.get("/api/v1/recommendations")
+def list_recommendations(cursor: str | None = None, limit: int = Query(default=20, ge=1, le=50),
+                         account_id: str = Depends(account_id_from_header), services: AppServices = Depends(get_services)):
     offset = decode_cursor(cursor)
-    records = [
-        item
-        for item in store.recommendations.values()
-        if item["account_id"] == account_id and not item.get("deleted_at")
-    ]
-    records.sort(key=lambda item: item["generated_at"], reverse=True)
-    page = records[offset : offset + limit]
-    items = [
-        {
-            "recommendation_id": item["recommendation_id"],
-            "source": item["source"],
-            "generated_at": item["generated_at"],
-            "course_count": len(item["items"]),
-        }
-        for item in page
-    ]
-    has_more = offset + limit < len(records)
-    return {"items": items, "next_cursor": encode_cursor(offset + limit) if has_more else None, "has_more": has_more}
+    items, has_more = services.repository.list_recommendations(account_id, offset, limit)
+    return page_response(items, has_more, offset, limit)
 
 
-@app.get("/api/v1/recommendations/{recommendation_id}")
-def get_recommendation(recommendation_id: str, account_id: str = Depends(account_id_from_header)):
-    record = recommendation_for(account_id, recommendation_id)
-    return copy.deepcopy({key: value for key, value in record.items() if key not in {"account_id", "deleted_at"}})
-
-
-@app.delete("/api/v1/recommendations/{recommendation_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_recommendation(recommendation_id: str, account_id: str = Depends(account_id_from_header)):
-    record = store.recommendations.get(recommendation_id)
-    if record and record["account_id"] != account_id:
+@router.get("/api/v1/recommendations/{recommendation_id}")
+def get_recommendation(recommendation_id: str, account_id: str = Depends(account_id_from_header),
+                       services: AppServices = Depends(get_services)):
+    record = services.repository.get_recommendation(account_id, recommendation_id)
+    if record is None:
         raise AppError(404, "RECOMMENDATION_NOT_FOUND", "推荐记录不存在。")
-    if record:
-        record["deleted_at"] = iso()
+    return record
+
+
+@router.delete("/api/v1/recommendations/{recommendation_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_recommendation(recommendation_id: str, account_id: str = Depends(account_id_from_header),
+                          services: AppServices = Depends(get_services)):
+    try:
+        services.repository.soft_delete_recommendation(account_id, recommendation_id, reject_foreign=True)
+    except KeyError as exc:
+        raise AppError(404, "RECOMMENDATION_NOT_FOUND", "推荐记录不存在。") from exc
     return Response(status_code=204)
 
 
-@app.get("/api/v1/favorites")
-def list_favorites(
-    cursor: str | None = None,
-    limit: int = Query(default=20, ge=1, le=50),
-    account_id: str = Depends(account_id_from_header),
-):
+@router.get("/api/v1/favorites")
+def list_favorites(cursor: str | None = None, limit: int = Query(default=20, ge=1, le=50),
+                   account_id: str = Depends(account_id_from_header), services: AppServices = Depends(get_services)):
     offset = decode_cursor(cursor)
-    records = sorted(store.favorites[account_id].items(), key=lambda item: item[1], reverse=True)
-    page = records[offset : offset + limit]
-    items = [
-        {"course": catalog.public_course(catalog.get(course_id)), "created_at": created_at}
-        for course_id, created_at in page
-        if catalog.get(course_id)
-    ]
-    has_more = offset + limit < len(records)
-    return {"items": items, "next_cursor": encode_cursor(offset + limit) if has_more else None, "has_more": has_more}
+    items, has_more = services.repository.list_favorites(account_id, offset, limit)
+    return page_response(items, has_more, offset, limit)
 
 
-@app.put("/api/v1/favorites/{course_id}")
-def add_favorite(course_id: str, account_id: str = Depends(account_id_from_header)):
-    course = catalog.get(course_id)
-    if not course:
-        raise AppError(404, "COURSE_NOT_FOUND", "课程不存在。")
-    created_at = store.favorites[account_id].setdefault(course_id, iso())
-    return {"course": catalog.public_course(course), "created_at": created_at}
+@router.put("/api/v1/favorites/{course_id}")
+def add_favorite(course_id: str, account_id: str = Depends(account_id_from_header),
+                  services: AppServices = Depends(get_services)):
+    try:
+        return services.repository.add_favorite(account_id, course_id)
+    except KeyError as exc:
+        raise AppError(404, "COURSE_NOT_FOUND", "课程不存在。") from exc
 
 
-@app.delete("/api/v1/favorites/{course_id}", status_code=status.HTTP_204_NO_CONTENT)
-def remove_favorite(course_id: str, account_id: str = Depends(account_id_from_header)):
-    store.favorites[account_id].pop(course_id, None)
+@router.delete("/api/v1/favorites/{course_id}", status_code=status.HTTP_204_NO_CONTENT)
+def remove_favorite(course_id: str, account_id: str = Depends(account_id_from_header),
+                     services: AppServices = Depends(get_services)):
+    services.repository.remove_favorite(account_id, course_id)
     return Response(status_code=204)
+
+
+def create_app(database_path: Path | str | None = None, jwt_secret: str | None = None) -> FastAPI:
+    settings = get_app_settings()
+
+    @asynccontextmanager
+    async def lifespan(application: FastAPI):
+        database = Database(Path(database_path) if database_path is not None else settings.database_path)
+        validate_core_schema(database)
+        apply_migrations(database, Path(__file__).resolve().parents[1] / "migrations")
+        with database.connect() as connection:
+            connection.execute("PRAGMA journal_mode = WAL").fetchone()
+        repository = ApplicationRepository(database)
+        auth = AuthService(repository, jwt_secret if jwt_secret is not None else settings.jwt_secret)
+        catalog = CourseCatalog(database)
+        base_services = AppServices(database, repository, auth, catalog)
+        tool_registry = build_course_tool_registry(base_services)
+        register_write_tools(tool_registry, base_services)
+
+        def rules_fallback(account_id: str, session_id: str, message: str) -> dict[str, Any]:
+            current = repository.get_chat_session(account_id, session_id)
+            if current is None:
+                raise KeyError(session_id)
+            transition = prepare_chat_transition(catalog, current, message)
+            committed = repository.commit_agent_transition(account_id, session_id, transition)
+            events: list[tuple[str, dict[str, Any]]] = [
+                ("course.match_required", resolution) for resolution in committed["resolutions"]
+            ]
+            if transition.profile_event:
+                events.append((transition.profile_event, {
+                    "profile_draft": committed["session"]["profile_draft"],
+                    "state": committed["session"]["state"],
+                }))
+            return {"text": transition.reply, "events": events}
+
+        agent_runtime = AgentLoop(
+            repository=repository,
+            context_builder=AgentContextBuilder(repository),
+            registry=tool_registry,
+            policy=PolicyGuard(tool_registry),
+            executor=ToolExecutor(tool_registry, repository),
+            fallback_handler=rules_fallback,
+        )
+        admin_service = AdminService(database, jwt_secret if jwt_secret is not None else settings.jwt_secret, catalog)
+        admin_service.ensure_seed(settings.admin_username, settings.admin_password, settings.admin_display_name)
+        services = AppServices(database, repository, auth, catalog, agent_runtime, admin_service)
+        if repository.get_account_by_username("course_demo") is None:
+            try:
+                auth.create_account("course_demo", "demo1234")
+            except ValueError as exc:
+                # Concurrent workers may race to seed; repository uniqueness protects the winner.
+                if str(exc) != "duplicate username":
+                    raise
+        application.state.services = services
+        try:
+            yield
+        finally:
+            del application.state.services
+
+    application = FastAPI(title="Course Compass API", version="0.1.0", lifespan=lifespan)
+    application.add_middleware(CORSMiddleware,
+                               allow_origins=["http://127.0.0.1:4173", "http://localhost:4173"],
+                               allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+    application.middleware("http")(request_context)
+    application.add_exception_handler(AppError, app_error_handler)
+    application.add_exception_handler(RequestValidationError, validation_error_handler)
+    application.add_exception_handler(sqlite3.Error, database_error_handler)
+    application.add_exception_handler(FileNotFoundError, database_error_handler)
+    application.include_router(router)
+    application.include_router(build_admin_router(get_services, AppError))
+    return application
+
+
+app = create_app()

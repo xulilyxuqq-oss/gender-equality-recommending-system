@@ -1,0 +1,50 @@
+<!doctype html>
+<!--
+THESIS: 管理端是一张持续工作的教务观测台，拒绝把每个指标切成等大的模板卡片。
+OWN-WORLD: 暖纸工作面、深墨导航、账册分隔线；黄色标记当前任务，薄荷绿表示确认，珊瑚色表示阻塞。
+STORY: 管理员先看系统是否可用，再处理目录与审计，最后用可追溯实验发布公平策略。
+FIRST VIEWPORT: 左侧全量导航，顶部状态轨道，中央连续工作纸，异常队列与最近操作并列；主操作固定在页面标题右侧。
+FORM: 已排序结构中的第 5 项“观测台 + 工作纸 + 检查面板”，Operate 模式，seed 6052d8b8。
+-->
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="description" content="性别公平课程推荐系统管理端" />
+    <meta name="color-scheme" content="light dark" />
+    <title>课序管理台</title>
+    <link rel="icon" href="data:," />
+    <link rel="stylesheet" href="./src/styles.css" />
+  </head>
+  <body>
+    <a class="skip-link" href="#admin-main">跳到主要内容</a>
+    <div id="admin-root" aria-live="polite">
+      <main class="boot-screen"><strong>课序管理台</strong><span>正在核对管理环境</span></main>
+    </div>
+    <div id="panel-root"></div>
+    <div id="toast-root" class="toast-region" aria-live="polite"></div>
+    <script>
+      if (window.location.protocol === "file:") {
+        document.querySelector("#admin-root").innerHTML = `
+          <main class="file-launch-page">
+            <section class="file-launch-ledger" aria-labelledby="file-launch-title">
+              <span class="file-launch-code">LOCAL SERVER REQUIRED</span>
+              <h1 id="file-launch-title">管理端不能直接双击打开</h1>
+              <p>浏览器会阻止本地文件加载 ES Module。请通过项目的本地服务访问，后端接口才能正常连接。</p>
+              <a class="button button-accent" href="http://127.0.0.1:4173/admin/">打开管理端</a>
+              <div class="file-launch-commands">
+                <strong>如果服务尚未启动</strong>
+                <code>python3 -m uvicorn backend.app.main:app --reload --port 8000</code>
+                <code>cd frontend &amp;&amp; python3 -m http.server 4173</code>
+              </div>
+            </section>
+          </main>`;
+      } else {
+        const application = document.createElement("script");
+        application.type = "module";
+        application.src = "./src/main.js";
+        document.body.append(application);
+      }
+    </script>
+  </body>
+</html>

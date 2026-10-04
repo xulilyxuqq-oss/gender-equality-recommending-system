@@ -2,15 +2,13 @@ from __future__ import annotations
 
 import json
 import re
+import sqlite3
 import unicodedata
 from collections import defaultdict
 from difflib import SequenceMatcher
-from pathlib import Path
 from typing import Any
 
-
-ROOT_DIR = Path(__file__).resolve().parents[2]
-DATASET_DIR = ROOT_DIR / "dataset"
+from .database import Database
 
 
 def normalize(value: str) -> str:
@@ -23,43 +21,63 @@ def display_difficulty(value: str) -> str:
 
 
 class CourseCatalog:
-    def __init__(self) -> None:
+    def __init__(self, database: Database) -> None:
+        self.database = database
         self.courses: dict[str, dict[str, Any]] = {}
-        self.user_courses: dict[str, set[str]] = defaultdict(set)
-        self.course_users: dict[str, set[str]] = defaultdict(set)
-        self.positive_ratings: dict[str, list[float]] = defaultdict(list)
+        self.aliases: dict[str, str] = {}
         self._load_courses()
-        self._load_interactions()
 
     def _load_courses(self) -> None:
-        path = DATASET_DIR / "course_info.jsonl"
-        with path.open("r", encoding="utf-8") as source:
-            for line in source:
-                raw = json.loads(line)
+        self.courses.clear()
+        self.aliases.clear()
+        with self.database.connect() as connection:
+            has_admin_tables = connection.execute(
+                "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'admin_course_records'"
+            ).fetchone() is not None
+            if has_admin_tables:
+                rows = connection.execute(
+                    """
+                    SELECT c.course_id, c.course_name, c.difficulty_level, c.is_advanced,
+                           c.advanced_label_rule, ci.course_category, ci.prerequisites
+                    FROM courses AS c
+                    JOIN course_information AS ci ON ci.course_id = c.course_id
+                    LEFT JOIN admin_course_records AS ac USING(course_id)
+                    WHERE COALESCE(ac.status, 'ACTIVE') = 'ACTIVE'
+                    ORDER BY c.course_id
+                    """
+                )
+            else:
+                rows = connection.execute(
+                    """
+                    SELECT c.course_id, c.course_name, c.difficulty_level, c.is_advanced,
+                           c.advanced_label_rule, ci.course_category, ci.prerequisites
+                    FROM courses AS c
+                    JOIN course_information AS ci ON ci.course_id = c.course_id
+                    ORDER BY c.course_id
+                    """
+                )
+            for row in rows:
                 course = {
-                    "course_id": raw["course_id"],
-                    "course_name": raw["course_name"],
-                    "fields": raw.get("fields_json", []),
-                    "difficulty_level": display_difficulty(raw.get("difficulty_level", "standard")),
-                    "is_advanced": bool(raw.get("is_advanced", False)),
-                    "advanced_label_rule": raw.get("advanced_label_rule", "prerequisite_count>=2"),
-                    "prerequisites": raw.get("prerequisites", []),
+                    "course_id": row["course_id"],
+                    "course_name": row["course_name"],
+                    "fields": json.loads(row["course_category"]),
+                    "difficulty_level": display_difficulty(row["difficulty_level"]),
+                    "is_advanced": bool(row["is_advanced"]),
+                    "advanced_label_rule": row["advanced_label_rule"],
+                    "prerequisites": json.loads(row["prerequisites"]),
                 }
                 course["normalized_name"] = normalize(course["course_name"])
                 self.courses[course["course_id"]] = course
+            if has_admin_tables:
+                for row in connection.execute(
+                    """SELECT ca.normalized_alias, ca.course_id FROM course_aliases AS ca
+                       LEFT JOIN admin_course_records AS ac USING(course_id)
+                       WHERE ca.status = 'ACTIVE' AND COALESCE(ac.status, 'ACTIVE') = 'ACTIVE'"""
+                ):
+                    self.aliases[row["normalized_alias"]] = row["course_id"]
 
-    def _load_interactions(self) -> None:
-        path = DATASET_DIR / "user_course_interactions.jsonl"
-        with path.open("r", encoding="utf-8") as source:
-            for line in source:
-                raw = json.loads(line)
-                user_id = raw["user_id"]
-                course_id = raw["course_id"]
-                self.user_courses[user_id].add(course_id)
-                self.course_users[course_id].add(user_id)
-                comment = raw.get("comment", 0)
-                if isinstance(comment, (int, float)) and comment > 0:
-                    self.positive_ratings[course_id].append(float(comment))
+    def reload(self) -> None:
+        self._load_courses()
 
     @staticmethod
     def public_course(course: dict[str, Any]) -> dict[str, Any]:
@@ -99,12 +117,16 @@ class CourseCatalog:
             "数据库入门": "数据库",
         }
         target = aliases.get(term, term)
+        managed_alias_course_id = self.aliases.get(term)
         candidates: list[tuple[float, str, dict[str, Any]]] = []
 
         for course in self.courses.values():
             name = course["normalized_name"]
             reason = "FUZZY_NAME"
-            if target == name:
+            if managed_alias_course_id == course["course_id"]:
+                score = 0.99
+                reason = "MANAGED_ALIAS"
+            elif target == name:
                 score = 1.0
                 reason = "EXACT_NAME"
             elif target in name or name in target:
@@ -141,40 +163,44 @@ class CourseCatalog:
     def _prerequisites_satisfied(self, course: dict[str, Any], completed: set[str]) -> bool:
         return all(item["course_id"] in completed for item in course["prerequisites"])
 
-    def recommendations(self, completed_ids: list[str], top_n: int) -> tuple[str, list[dict[str, Any]]]:
-        completed = set(completed_ids)
+    def recommendations(self, user_id: str, top_n: int) -> tuple[str, list[dict[str, Any]]]:
+        with self.database.connect() as connection:
+            completed = {
+                row["course_id"]
+                for row in connection.execute(
+                    "SELECT course_id FROM user_completed_courses WHERE user_id = ?",
+                    (user_id,),
+                )
+            }
+            histories = self._neighbor_histories(connection, completed)
+
         scores: dict[str, float] = defaultdict(float)
         source = "collaborative" if completed else "popular_fallback"
 
         if completed:
-            neighbor_ids: set[str] = set()
-            for course_id in completed:
-                neighbor_ids.update(self.course_users.get(course_id, set()))
-
             similarities: list[tuple[float, str]] = []
-            for user_id in neighbor_ids:
-                history = self.user_courses[user_id]
+            for neighbor_id, history in histories.items():
                 union = completed | history
                 if not union:
                     continue
                 similarity = len(completed & history) / len(union)
                 if similarity > 0:
-                    similarities.append((similarity, user_id))
+                    similarities.append((similarity, neighbor_id))
             similarities.sort(key=lambda item: (-item[0], item[1]))
 
-            for similarity, user_id in similarities[:80]:
-                for course_id in self.user_courses[user_id] - completed:
+            for similarity, neighbor_id in similarities[:80]:
+                for course_id in histories[neighbor_id] - completed:
                     scores[course_id] += similarity
 
         if not scores:
             source = "popular_fallback"
-            for course_id, users in self.course_users.items():
+            with self.database.connect() as connection:
+                popularity = self._popular_courses(connection)
+            for course_id, user_count, average in popularity:
                 course = self.courses.get(course_id)
                 if not course or course["prerequisites"]:
                     continue
-                ratings = self.positive_ratings.get(course_id, [])
-                average = sum(ratings) / len(ratings) if ratings else 0.0
-                scores[course_id] = len(users) * 100 + average
+                scores[course_id] = user_count * 100 + average
 
         ranked: list[tuple[float, dict[str, Any]]] = []
         for course_id, score in scores.items():
@@ -207,6 +233,54 @@ class CourseCatalog:
             )
         return source, items
 
+    @staticmethod
+    def _neighbor_histories(
+        connection: sqlite3.Connection, completed: set[str]
+    ) -> dict[str, set[str]]:
+        if not completed:
+            return {}
 
-catalog = CourseCatalog()
+        placeholders = ", ".join("?" for _ in completed)
+        neighbor_rows = connection.execute(
+            f"""
+            SELECT DISTINCT user_id
+            FROM interactions
+            WHERE course_id IN ({placeholders})
+            ORDER BY user_id
+            """,
+            tuple(completed),
+        )
+        neighbor_ids = [row["user_id"] for row in neighbor_rows]
+        if not neighbor_ids:
+            return {}
+
+        neighbor_placeholders = ", ".join("?" for _ in neighbor_ids)
+        histories: dict[str, set[str]] = defaultdict(set)
+        for row in connection.execute(
+            f"""
+            SELECT user_id, course_id
+            FROM interactions
+            WHERE user_id IN ({neighbor_placeholders})
+            ORDER BY user_id, course_id
+            """,
+            tuple(neighbor_ids),
+        ):
+            histories[row["user_id"]].add(row["course_id"])
+        return histories
+
+    @staticmethod
+    def _popular_courses(connection: sqlite3.Connection) -> list[tuple[str, int, float]]:
+        return [
+            (row["course_id"], row["user_count"], row["average_rating"])
+            for row in connection.execute(
+                """
+                SELECT course_id,
+                       COUNT(*) AS user_count,
+                       COALESCE(AVG(CASE WHEN comment > 0 THEN comment END), 0.0)
+                           AS average_rating
+                FROM interactions
+                GROUP BY course_id
+                """
+            )
+        ]
 
